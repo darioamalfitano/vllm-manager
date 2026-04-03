@@ -467,6 +467,7 @@ class VLLMDetector:
         """Detect standard vLLM (CUDA) installation."""
         # Common venv locations
         candidates = [
+            os.path.expanduser("~/local-venv"),
             "/root/vllm-env",
             os.path.expanduser("~/vllm-env"),
             os.path.expanduser("~/.venv/vllm"),

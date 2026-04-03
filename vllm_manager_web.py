@@ -409,6 +409,7 @@ class VLLMDetector:
 
     def _detect_cuda(self):
         candidates = [
+            os.path.expanduser("~/local-venv"),
             "/root/vllm-env",
             os.path.expanduser("~/vllm-env"),
             os.path.expanduser("~/.venv/vllm"),
@@ -1188,6 +1189,173 @@ def api_platform():
     })
 
 
+# --- API: DGX Spark ---
+
+@app.route("/api/dgx/cluster")
+def api_dgx_cluster():
+    lines = []
+    rc, out, _ = runner.run("hostname", timeout=5)
+    hostname = out.strip() if rc == 0 else "unknown"
+    rc, out, _ = runner.run("hostname -I", timeout=5)
+    ips = out.strip() if rc == 0 else "?"
+    lines.append("Nodo locale: %s  IP: %s" % (hostname, ips))
+
+    rc, out, _ = runner.run(
+        "nvidia-smi --query-gpu=name,memory.used,memory.total,temperature.gpu,utilization.gpu "
+        "--format=csv,noheader,nounits", timeout=5)
+    if rc == 0 and out.strip():
+        for gpu_line in out.strip().splitlines():
+            parts = [p.strip() for p in gpu_line.split(",")]
+            if len(parts) >= 5:
+                lines.append("  GPU: %s  %s/%s MB  Temp: %s C  Util: %s%%" % (
+                    parts[0], parts[1], parts[2], parts[3], parts[4]))
+
+    rc, out, _ = runner.run("ray status 2>/dev/null", timeout=10)
+    if rc == 0 and out.strip():
+        lines.append("\nRay Cluster:")
+        for ray_line in out.strip().splitlines()[:10]:
+            lines.append("  " + ray_line)
+    else:
+        lines.append("\nRay: non attivo")
+
+    return jsonify({"text": "\n".join(lines)})
+
+
+@app.route("/api/dgx/discover")
+def api_dgx_discover():
+    lines = []
+    rc, out, _ = runner.run(
+        "ip -br addr show | grep -E '(enP|enp|mlx)'", timeout=10)
+    if rc == 0 and out.strip():
+        lines.append("Interfacce di rete:")
+        for line in out.strip().splitlines():
+            lines.append("  " + line.strip())
+
+    rc, out, _ = runner.run("arp -a 2>/dev/null | head -20", timeout=10)
+    if rc == 0 and out.strip():
+        lines.append("\nNodi rilevati (ARP):")
+        for line in out.strip().splitlines():
+            lines.append("  " + line.strip())
+
+    return jsonify({"text": "\n".join(lines) if lines else "Nessun nodo aggiuntivo rilevato."})
+
+
+@app.route("/api/dgx/connectivity")
+def api_dgx_connectivity():
+    rc, out, _ = runner.run("ping -c 2 -W 2 localhost", timeout=10)
+    status = "OK" if rc == 0 else "FAIL"
+    log_queue.put("[NETWORK] localhost: %s\n" % status)
+    return jsonify({"status": status})
+
+
+@app.route("/api/dgx/nccl-test")
+def api_dgx_nccl_test():
+    rc, out, err = runner.run(
+        "python3 -c \""
+        "import torch; import torch.distributed as dist; "
+        "print('NCCL available:', torch.cuda.nccl.is_available(torch.randn(1).cuda())); "
+        "print('CUDA devices:', torch.cuda.device_count())\"",
+        timeout=30)
+    if rc == 0:
+        log_queue.put("[NCCL] %s\n" % out.strip())
+        return jsonify({"text": out.strip()})
+    else:
+        msg = err.strip() or "test failed"
+        log_queue.put("[NCCL ERROR] %s\n" % msg)
+        return jsonify({"text": "ERROR: " + msg})
+
+
+@app.route("/api/dgx/ray/start-head", methods=["POST"])
+def api_dgx_ray_start():
+    def _run():
+        rc, out, err = runner.run(
+            "ray start --head --port=6379 --dashboard-host=0.0.0.0", timeout=30)
+        if rc == 0:
+            log_queue.put("[RAY] Head node started.\n%s\n" % out.strip())
+        else:
+            log_queue.put("[RAY ERROR] %s\n" % (err.strip() or out.strip()))
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "starting"})
+
+
+@app.route("/api/dgx/ray/connect-worker", methods=["POST"])
+def api_dgx_ray_connect():
+    data = flask_request.json or {}
+    worker_ip = data.get("ip", "").strip()
+    worker_user = data.get("user", "root").strip()
+    if not worker_ip:
+        return jsonify({"error": "IP mancante"}), 400
+
+    def _run():
+        rc, head_ip, _ = runner.run("hostname -I | awk '{print $1}'", timeout=5)
+        head_ip = head_ip.strip()
+        if not head_ip:
+            log_queue.put("[ERROR] Cannot determine head IP.\n")
+            return
+        rc, out, err = runner.run(
+            "ssh %s@%s 'ray start --address=%s:6379'" % (worker_user, worker_ip, head_ip),
+            timeout=30)
+        if rc == 0:
+            log_queue.put("[RAY] Worker %s connected.\n" % worker_ip)
+        else:
+            log_queue.put("[RAY ERROR] %s\n" % (err.strip() or out.strip()))
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "connecting"})
+
+
+@app.route("/api/dgx/ray/stop", methods=["POST"])
+def api_dgx_ray_stop():
+    def _run():
+        runner.run("ray stop", timeout=15)
+        log_queue.put("[RAY] Ray stopped.\n")
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "stopping"})
+
+
+@app.route("/api/dgx/env", methods=["POST"])
+def api_dgx_env():
+    data = flask_request.json or {}
+    if isinstance(runner, DGXCommandRunner):
+        for key, value in data.items():
+            runner.update_env(key, value)
+        log_queue.put("[INFO] DGX env vars updated.\n")
+    return jsonify({"status": "updated"})
+
+
+@app.route("/api/dgx/ssh/setup", methods=["POST"])
+def api_dgx_ssh_setup():
+    data = flask_request.json or {}
+    ip = data.get("ip", "").strip()
+    user = data.get("user", "root").strip()
+    if not ip:
+        return jsonify({"error": "IP mancante"}), 400
+
+    def _run():
+        runner.run("test -f ~/.ssh/id_rsa || ssh-keygen -t rsa -b 4096 -N '' -f ~/.ssh/id_rsa", timeout=10)
+        rc, out, err = runner.run(
+            "ssh-copy-id -o StrictHostKeyChecking=no %s@%s" % (user, ip), timeout=30)
+        if rc == 0:
+            log_queue.put("[SSH] Chiavi copiate su %s@%s\n" % (user, ip))
+        else:
+            log_queue.put("[SSH ERROR] %s\n" % (err.strip() or "errore"))
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "setting_up"})
+
+
+@app.route("/api/dgx/ssh/test", methods=["POST"])
+def api_dgx_ssh_test():
+    data = flask_request.json or {}
+    ip = data.get("ip", "").strip()
+    user = data.get("user", "root").strip()
+    if not ip:
+        return jsonify({"error": "IP mancante"}), 400
+    rc, out, err = runner.run(
+        "ssh -o ConnectTimeout=5 %s@%s 'hostname'" % (user, ip), timeout=15)
+    if rc == 0:
+        return jsonify({"status": "ok", "hostname": out.strip()})
+    return jsonify({"status": "fail", "error": err.strip() or "connessione fallita"})
+
+
 # ---------------------------------------------------------------------------
 # HTML Template
 # ---------------------------------------------------------------------------
@@ -1622,12 +1790,94 @@ select { cursor: pointer; }
 {% if is_dgx %}
 <!-- Tab 8: DGX Spark -->
 <div class="tab-panel" id="tab-dgx">
+  <!-- Cluster Overview -->
   <div class="card">
     <h3>Cluster Overview</h3>
     <div class="console" id="dgx-cluster" style="max-height:200px">Caricamento...</div>
+    <div class="btn-row" style="margin-top:8px">
+      <button class="btn btn-primary" onclick="refreshDGXCluster()">Aggiorna Stato Cluster</button>
+      <span id="dgx-cluster-status" style="font-size:12px;color:var(--fg3);align-self:center"></span>
+    </div>
   </div>
+
+  <!-- Node Discovery & Network -->
   <div class="card">
-    <h3>Multi-Node Presets</h3>
+    <h3>Node Discovery & Network</h3>
+    <div class="btn-row" style="margin-bottom:8px">
+      <button class="btn btn-secondary" onclick="dgxDiscover()">Rileva Nodi</button>
+      <button class="btn btn-secondary" onclick="dgxTestConnectivity()">Test Connettivita'</button>
+      <button class="btn btn-secondary" onclick="dgxTestNCCL()">Test NCCL All-Reduce</button>
+    </div>
+    <div class="console" id="dgx-nodes" style="max-height:150px"></div>
+
+    <h3 style="margin-top:16px">Variabili Ambiente NCCL</h3>
+    <div class="form-row">
+      <div>
+        <label>NCCL_SOCKET_IFNAME</label>
+        <input type="text" id="dgx-env-nccl-socket" value="enP2p1s0f1np1">
+      </div>
+      <div>
+        <label>UCX_NET_DEVICES</label>
+        <input type="text" id="dgx-env-ucx" value="enP2p1s0f1np1">
+      </div>
+    </div>
+    <div class="form-row">
+      <div>
+        <label>GLOO_SOCKET_IFNAME</label>
+        <input type="text" id="dgx-env-gloo" value="enp1s0f1np1">
+      </div>
+      <div>
+        <label>NCCL_IB_HCA</label>
+        <input type="text" id="dgx-env-ib" value="mlx5_0,mlx5_1">
+      </div>
+    </div>
+    <button class="btn btn-secondary" onclick="dgxApplyEnv()" style="margin-top:4px">Applica Env Vars</button>
+  </div>
+
+  <!-- Ray Cluster -->
+  <div class="card">
+    <h3>Ray Cluster</h3>
+    <div class="btn-row" style="margin-bottom:8px">
+      <button class="btn btn-success" onclick="dgxRayStartHead()">Avvia Ray Head</button>
+      <button class="btn btn-primary" onclick="dgxRayConnectWorker()">Connetti Worker</button>
+      <button class="btn btn-danger" onclick="dgxRayStop()">Stop Ray</button>
+    </div>
+    <div id="dgx-ray-status" style="font-size:13px;margin-bottom:8px;color:var(--fg2)">Ray: sconosciuto</div>
+    <div class="form-row">
+      <div>
+        <label>Worker IP</label>
+        <input type="text" id="dgx-worker-ip" placeholder="192.168.1.x">
+      </div>
+      <div>
+        <label>User</label>
+        <input type="text" id="dgx-worker-user" value="root">
+      </div>
+    </div>
+  </div>
+
+  <!-- Multi-Node Inference -->
+  <div class="card">
+    <h3>Multi-Node Inference</h3>
+    <div class="form-row three">
+      <div>
+        <label>Tensor Parallel Size</label>
+        <input type="number" id="dgx-tp" value="1" min="1" max="8">
+      </div>
+      <div>
+        <label>Pipeline Parallel Size</label>
+        <input type="number" id="dgx-pp" value="1" min="1" max="8">
+      </div>
+      <div>
+        <label>Attention Backend</label>
+        <select id="dgx-attn">
+          <option value="TRITON_ATTN">TRITON_ATTN</option>
+          <option value="FLASHINFER">FLASHINFER</option>
+          <option value="XFORMERS">XFORMERS</option>
+        </select>
+      </div>
+    </div>
+
+    <h3 style="margin-top:12px">Preset Multi-Nodo</h3>
     <table class="data-table">
       <thead><tr><th>Modello</th><th>Nodi</th><th>TP</th><th>VRAM</th></tr></thead>
       <tbody>
@@ -1637,12 +1887,33 @@ select { cursor: pointer; }
         {"name":"Qwen/Qwen2.5-72B-Instruct","nodes":1,"tp":1,"vram":"~72 GB"},
         {"name":"mistralai/Mixtral-8x22B-v0.1","nodes":2,"tp":2,"vram":"~180 GB"}
       ] %}
-      <tr onclick="document.getElementById('model-select').value='';document.getElementById('model-custom').style.display='block';document.getElementById('model-custom').value='{{p.name}}';document.getElementById('tp-size').value='{{p.tp}}';switchTab('server');">
+      <tr onclick="document.getElementById('model-select').value='';document.getElementById('model-custom').style.display='block';document.getElementById('model-custom').value='{{p.name}}';document.getElementById('tp-size').value='{{p.tp}}';document.getElementById('dgx-tp').value='{{p.tp}}';switchTab('server');">
         <td>{{p.name}}</td><td>{{p.nodes}}</td><td>{{p.tp}}</td><td>{{p.vram}}</td>
       </tr>
       {% endfor %}
       </tbody>
     </table>
+    <button class="btn btn-success" style="margin-top:8px" onclick="dgxStartMultiNode()">Start Multi-Node Server</button>
+  </div>
+
+  <!-- SSH Configuration -->
+  <div class="card">
+    <h3>SSH Configuration</h3>
+    <div class="form-row">
+      <div>
+        <label>Target IP</label>
+        <input type="text" id="dgx-ssh-ip" placeholder="192.168.1.x">
+      </div>
+      <div>
+        <label>User</label>
+        <input type="text" id="dgx-ssh-user" value="root">
+      </div>
+    </div>
+    <div class="btn-row" style="margin-top:4px">
+      <button class="btn btn-secondary" onclick="dgxSSHSetup()">Setup SSH Keys</button>
+      <button class="btn btn-secondary" onclick="dgxSSHTest()">Test Connessione</button>
+      <span id="dgx-ssh-status" style="font-size:12px;color:var(--fg3);align-self:center"></span>
+    </div>
   </div>
 </div>
 {% endif %}
@@ -2090,6 +2361,119 @@ async function deleteProfile() {
 }
 
 refreshProfiles();
+
+// --- DGX Spark ---
+async function refreshDGXCluster() {
+  document.getElementById('dgx-cluster-status').textContent = 'Rilevamento...';
+  try {
+    const data = await apiGet('/api/dgx/cluster');
+    document.getElementById('dgx-cluster').textContent = data.text || 'Nessun dato';
+    document.getElementById('dgx-cluster-status').textContent = 'Aggiornato';
+  } catch(e) {
+    document.getElementById('dgx-cluster-status').textContent = 'Errore: ' + e.message;
+  }
+}
+
+async function dgxDiscover() {
+  const el = document.getElementById('dgx-nodes');
+  el.textContent = 'Scansione nodi...';
+  try {
+    const data = await apiGet('/api/dgx/discover');
+    el.textContent = data.text || 'Nessun nodo rilevato.';
+  } catch(e) {
+    el.textContent = 'Errore: ' + e.message;
+  }
+}
+
+async function dgxTestConnectivity() {
+  showToast('Test connettivita in corso...', '');
+  const data = await apiGet('/api/dgx/connectivity');
+  showToast('Connettivita: ' + data.status, data.status === 'OK' ? 'success' : 'error');
+}
+
+async function dgxTestNCCL() {
+  showToast('Test NCCL in corso...', '');
+  const data = await apiGet('/api/dgx/nccl-test');
+  document.getElementById('dgx-nodes').textContent = data.text;
+}
+
+async function dgxApplyEnv() {
+  await apiPost('/api/dgx/env', {
+    NCCL_SOCKET_IFNAME: document.getElementById('dgx-env-nccl-socket').value,
+    UCX_NET_DEVICES: document.getElementById('dgx-env-ucx').value,
+    GLOO_SOCKET_IFNAME: document.getElementById('dgx-env-gloo').value,
+    NCCL_IB_HCA: document.getElementById('dgx-env-ib').value,
+  });
+  showToast('Variabili ambiente aggiornate', 'success');
+}
+
+async function dgxRayStartHead() {
+  await apiPost('/api/dgx/ray/start-head');
+  document.getElementById('dgx-ray-status').textContent = 'Ray: avvio head in corso...';
+  showToast('Avvio Ray head...', 'success');
+  setTimeout(refreshDGXCluster, 5000);
+}
+
+async function dgxRayConnectWorker() {
+  const ip = document.getElementById('dgx-worker-ip').value.trim();
+  const user = document.getElementById('dgx-worker-user').value.trim();
+  if (!ip) { showToast('Inserisci IP del worker', 'error'); return; }
+  await apiPost('/api/dgx/ray/connect-worker', {ip, user});
+  document.getElementById('dgx-ray-status').textContent = 'Ray: connessione worker ' + ip + '...';
+  showToast('Connessione worker ' + ip + '...', 'success');
+}
+
+async function dgxRayStop() {
+  await apiPost('/api/dgx/ray/stop');
+  document.getElementById('dgx-ray-status').textContent = 'Ray: fermato';
+  showToast('Ray fermato', 'success');
+}
+
+async function dgxStartMultiNode() {
+  const model = getModel();
+  if (!model) { showToast('Seleziona un modello', 'error'); return; }
+  const tp = parseInt(document.getElementById('dgx-tp').value);
+  const pp = parseInt(document.getElementById('dgx-pp').value);
+  const attn = document.getElementById('dgx-attn').value;
+  const extra = pp > 1 ? '--pipeline-parallel-size ' + pp : '';
+  await apiPost('/api/server/start', {
+    model, tp_size: tp, attention_backend: attn,
+    extra_args: extra,
+    gpu_mem_util: parseFloat(document.getElementById('gpu-mem')?.value || 0.90),
+    dtype: document.getElementById('dtype').value,
+    host: '0.0.0.0',
+    port: parseInt(document.getElementById('port').value),
+  });
+  showToast('Avvio multi-node server: TP=' + tp + ' PP=' + pp, 'success');
+  switchTab('server');
+}
+
+async function dgxSSHSetup() {
+  const ip = document.getElementById('dgx-ssh-ip').value.trim();
+  const user = document.getElementById('dgx-ssh-user').value.trim();
+  if (!ip) { showToast('Inserisci IP target', 'error'); return; }
+  document.getElementById('dgx-ssh-status').textContent = 'Configurazione SSH...';
+  await apiPost('/api/dgx/ssh/setup', {ip, user});
+  document.getElementById('dgx-ssh-status').textContent = 'Setup avviato, controlla i log.';
+}
+
+async function dgxSSHTest() {
+  const ip = document.getElementById('dgx-ssh-ip').value.trim();
+  const user = document.getElementById('dgx-ssh-user').value.trim();
+  if (!ip) { showToast('Inserisci IP target', 'error'); return; }
+  document.getElementById('dgx-ssh-status').textContent = 'Test connessione...';
+  const data = await apiPost('/api/dgx/ssh/test', {ip, user});
+  if (data.status === 'ok') {
+    document.getElementById('dgx-ssh-status').textContent = 'OK: connesso a ' + data.hostname + ' (' + ip + ')';
+  } else {
+    document.getElementById('dgx-ssh-status').textContent = 'FAIL: ' + (data.error || 'connessione fallita');
+  }
+}
+
+// Auto-load DGX cluster on page load if DGX
+if (document.getElementById('tab-dgx')) {
+  setTimeout(refreshDGXCluster, 1500);
+}
 </script>
 </body>
 </html>
