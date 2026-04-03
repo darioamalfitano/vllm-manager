@@ -226,29 +226,159 @@ Gestisce un container Docker di [Open WebUI](https://github.com/open-webui/open-
 
 ### 4.8 Tab DGX Spark (solo su DGX)
 
+Il tab DGX permette di gestire un cluster multi-nodo **interamente dal nodo head**, senza dover accedere fisicamente ai worker. L'unica cosa che serve e' che i worker siano accesi, connessi alla rete, e abbiano SSH attivo.
+
 #### Cluster Overview
 - Hostname, IP, info GPU, stato Ray
 - Clicca "Aggiorna Stato Cluster" per refresh
 
+#### Gestione Worker Remoti
+
+Sezione centrale per il multi-nodo. Qui aggiungi i nodi worker e li gestisci dal head.
+
+**Aggiungere un worker:**
+1. Inserisci IP, user SSH (default: root), e un alias opzionale
+2. Clicca "Aggiungi Worker"
+3. Il worker appare nella tabella con stato "Aggiunto"
+
+**Ciclo di vita di ogni worker (tutto dal head):**
+
+| Stato | Significato | Azioni disponibili |
+|-------|-------------|-------------------|
+| Aggiunto | Appena inserito | Setup SSH |
+| SSH OK | Chiavi SSH copiate e verificate | Installa vLLM, Verifica |
+| Installazione... | Installazione remota in corso (20-40 min) | Nessuna (attendi) |
+| Installato | vLLM installato con successo | Verifica |
+| Pronto | GPU, vLLM e Ray verificati | Pronto per Ray |
+| Ray Connesso | Connesso al cluster Ray | Gestito dal cluster |
+| Errore | Qualcosa e' fallito | Riprova SSH, Riprova Installa |
+
+**Setup SSH:**
+- Genera chiave RSA sul head (se non esiste)
+- Copia la chiave pubblica sul worker con `ssh-copy-id`
+- Verifica che la connessione SSH funzioni senza password
+- Nota: la prima volta potrebbe chiedere la password del worker nel terminale
+
+**Installazione remota vLLM:**
+- Esegue gli stessi 9 step dell'installazione locale, ma via SSH
+- Include: uv, PyTorch cu130, Triton da source, vLLM con patch sm_121
+- Richiede 20-40 minuti per worker
+- Una sola installazione alla volta (per evitare conflitti nei log)
+- Progresso visibile nel tab Logs con prefisso `[WORKER <ip>]`
+
+**Verifica:**
+- Controlla via SSH: GPU (nvidia-smi), vLLM (import), Ray (import)
+- Se tutto OK, lo stato diventa "Pronto"
+
 #### Node Discovery & Network
-- **Rileva Nodi** — scansiona interfacce di rete e tabella ARP
+- **Rileva Nodi** — scansiona interfacce di rete e tabella ARP per trovare altri DGX sulla rete
 - **Test Connettivita'** — ping localhost
-- **Test NCCL All-Reduce** — verifica NCCL e CUDA devices
+- **Test NCCL All-Reduce** — verifica NCCL e numero CUDA devices
 - **Variabili NCCL** — modifica NCCL_SOCKET_IFNAME, UCX_NET_DEVICES, GLOO_SOCKET_IFNAME, NCCL_IB_HCA
 
 #### Ray Cluster
-- **Avvia Ray Head** — avvia il nodo head su questa macchina
-- **Connetti Worker** — connetti un altro DGX Spark come worker (serve IP e user)
-- **Stop Ray** — ferma Ray su tutti i nodi
+- **Avvia Cluster Ray** — con un click: avvia Ray head su questo nodo, poi connette automaticamente tutti i worker con stato "pronto" o "installato"
+- **Stop Cluster Ray** — ferma Ray su tutti i worker (via SSH) e poi sul head
 
 #### Multi-Node Inference
 - Configura **Tensor Parallel** e **Pipeline Parallel**
 - Usa i preset multi-nodo per modelli grandi (405B, Mixtral 8x22B)
 - Clicca "Start Multi-Node Server"
 
-#### SSH Configuration
-- **Setup SSH Keys** — genera e copia chiavi SSH su un nodo remoto
-- **Test Connessione** — verifica connettivita' SSH
+### 4.9 Guida Multi-Nodo passo-passo
+
+Questa guida copre la procedura completa per avviare un modello distribuito su piu' DGX Spark. **Tutto viene fatto dal nodo head.**
+
+#### Prerequisiti
+
+- 2+ DGX Spark sulla stessa rete
+- Tutti i nodi accesi con SSH attivo
+- Il web manager avviato **solo sul nodo head**
+
+#### Fase 1: Setup iniziale (una tantum)
+
+1. Avvia il manager sul nodo head:
+   ```bash
+   python vllm_manager_web.py --host 0.0.0.0 --port 5000
+   ```
+2. Apri il browser: `http://<ip-head>:5000`
+3. **Installa vLLM sul nodo head** dal tab Server (se non gia' fatto)
+
+#### Fase 2: Aggiungere i worker
+
+1. Vai al tab **DGX Spark**
+2. (Opzionale) Clicca **"Rileva Nodi"** per vedere gli IP sulla rete
+3. Per ogni worker:
+   - Inserisci IP, user (es. `root`), alias (es. `dgx-2`)
+   - Clicca **"+ Aggiungi Worker"**
+
+#### Fase 3: Setup SSH (per ogni worker)
+
+1. Nella tabella worker, clicca **"Setup SSH"** sul primo worker
+2. Attendi che lo stato diventi **"SSH OK"**
+3. Ripeti per ogni worker
+4. Nota: se il worker non ha le chiavi SSH preconfigurate, potrebbe servire inserire la password la prima volta nel terminale dove gira il manager
+
+#### Fase 4: Installare vLLM sui worker (per ogni worker)
+
+1. Clicca **"Installa vLLM"** sul primo worker (stato SSH OK)
+2. Lo stato diventa **"Installazione..."** — segui il progresso nel tab **Logs**
+3. Dopo 20-40 minuti lo stato diventa **"Installato"**
+4. **Una sola installazione alla volta** — attendi che finisca prima di iniziare la prossima
+5. Ripeti per ogni worker
+
+#### Fase 5: Verificare i worker
+
+1. Clicca **"Verifica"** su ogni worker installato
+2. Controlla che GPU, vLLM e Ray siano OK
+3. Lo stato diventa **"Pronto"**
+
+#### Fase 6: Configurare la rete (se necessario)
+
+1. Nella sezione **"Variabili Ambiente NCCL"**:
+   - Verifica che `NCCL_SOCKET_IFNAME` punti all'interfaccia ad alta velocita'
+   - Imposta `NCCL_IB_HCA` se hai InfiniBand
+2. Clicca **"Applica Env Vars"**
+3. Esegui **"Test NCCL All-Reduce"** per conferma
+
+#### Fase 7: Avviare il cluster Ray
+
+1. Clicca **"Avvia Cluster Ray (Head + Worker)"**
+2. Il sistema:
+   - Avvia Ray head su questo nodo (porta 6379)
+   - Si connette via SSH a ogni worker "pronto" e lancia `ray start`
+   - Aggiorna lo stato dei worker a "Ray Connesso"
+3. Verifica con **"Aggiorna Stato Cluster"** che tutti i nodi siano visibili
+
+#### Fase 8: Avviare il server multi-nodo
+
+1. Nella sezione **"Multi-Node Inference"**:
+   - Clicca su un preset (es. Llama 405B FP8 → TP=4) oppure imposta manualmente TP e PP
+   - TP = numero totale di GPU nel cluster (1 per nodo DGX Spark)
+2. Clicca **"Start Multi-Node Server"**
+3. Segui il caricamento nel tab **Logs**
+4. Quando il pallino diventa verde, l'API e' attiva su `http://<ip-head>:8000`
+
+#### Esempio: Llama 3.1 405B-FP8 su 4 nodi
+
+```
+Nodo head:  192.168.1.10 (qui gira il manager)
+Worker 1:   192.168.1.11
+Worker 2:   192.168.1.12
+Worker 3:   192.168.1.13
+
+TP = 4 (una GPU per nodo, 4 nodi)
+PP = 1
+Modello: meta-llama/Llama-3.1-405B-Instruct-FP8
+VRAM richiesta: ~100 GB per nodo
+```
+
+Il modello viene diviso su 4 GPU (~100 GB ciascuna). L'endpoint API e' solo sull'head:
+```bash
+curl http://192.168.1.10:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"meta-llama/Llama-3.1-405B-Instruct-FP8","messages":[{"role":"user","content":"Ciao!"}]}'
+```
 
 ---
 
@@ -386,20 +516,35 @@ Il manager espone le seguenti API REST:
 | POST | `/api/profiles/save` | Salva profilo |
 | POST | `/api/profiles/delete` | Elimina profilo |
 
-### DGX Spark
+### DGX Spark — Network & Diagnostica
 | Metodo | Endpoint | Descrizione |
 |--------|----------|-------------|
-| GET | `/api/dgx/cluster` | Overview cluster |
-| GET | `/api/dgx/discover` | Rileva nodi |
-| GET | `/api/dgx/connectivity` | Test connettivita' |
-| GET | `/api/dgx/nccl-test` | Test NCCL |
-| POST | `/api/dgx/ray/start-head` | Avvia Ray head |
-| POST | `/api/dgx/ray/connect-worker` | Connetti worker |
-| POST | `/api/dgx/ray/stop` | Stop Ray |
-| POST | `/api/dgx/env` | Aggiorna env vars |
-| POST | `/api/dgx/ssh/setup` | Setup SSH keys |
-| POST | `/api/dgx/ssh/test` | Test SSH |
+| GET | `/api/dgx/cluster` | Overview cluster (host, GPU, Ray) |
+| GET | `/api/dgx/discover` | Rileva nodi sulla rete (ARP) |
+| GET | `/api/dgx/connectivity` | Test connettivita' (ping) |
+| GET | `/api/dgx/nccl-test` | Test NCCL e GPU devices |
+| POST | `/api/dgx/env` | Aggiorna env vars NCCL/UCX |
 | GET | `/api/platform` | Info piattaforma |
+
+### DGX Spark — Gestione Worker Remoti
+| Metodo | Endpoint | Descrizione |
+|--------|----------|-------------|
+| GET | `/api/dgx/workers` | Lista worker con stato |
+| POST | `/api/dgx/workers/add` | Aggiungi worker `{ip, user, alias}` |
+| POST | `/api/dgx/workers/remove` | Rimuovi worker `{ip}` |
+| POST | `/api/dgx/workers/ssh-setup` | Setup SSH keys su worker `{ip}` |
+| POST | `/api/dgx/workers/ssh-test` | Test SSH verso worker `{ip}` |
+| POST | `/api/dgx/workers/install` | Installa vLLM su worker remoto `{ip}` (20-40 min) |
+| POST | `/api/dgx/workers/verify` | Verifica GPU/vLLM/Ray su worker `{ip}` |
+
+### DGX Spark — Ray Cluster
+| Metodo | Endpoint | Descrizione |
+|--------|----------|-------------|
+| POST | `/api/dgx/ray/start-head` | Avvia solo Ray head (uso avanzato) |
+| POST | `/api/dgx/ray/connect-worker` | Connetti singolo worker (uso avanzato) |
+| POST | `/api/dgx/ray/stop` | Stop solo Ray locale (uso avanzato) |
+| POST | `/api/dgx/ray/start-cluster` | Avvia Ray head + connetti tutti i worker pronti |
+| POST | `/api/dgx/ray/stop-cluster` | Stop Ray su tutti i worker e poi sull'head |
 
 ---
 
@@ -413,7 +558,7 @@ vllm-manager/
   .gitignore
 ```
 
-I profili e le configurazioni sono salvati in:
+I profili, le configurazioni e la lista worker sono salvati in:
 
 | Piattaforma | Path |
 |---|---|

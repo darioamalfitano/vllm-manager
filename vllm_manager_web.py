@@ -9,6 +9,7 @@ Requires: pip install flask
 
 import abc
 import argparse
+import base64
 import json
 import os
 import platform
@@ -551,7 +552,7 @@ class ConfigManager:
                 return json.loads(CONFIG_FILE.read_text("utf-8"))
             except Exception:
                 pass
-        return {"profiles": {}, "settings": {}}
+        return {"profiles": {}, "settings": {}, "workers": {}}
 
     def save(self):
         CONFIG_FILE.write_text(json.dumps(self.data, indent=2), "utf-8")
@@ -566,6 +567,25 @@ class ConfigManager:
     def delete_profile(self, name):
         self.data.get("profiles", {}).pop(name, None)
         self.save()
+
+    # --- Worker management ---
+
+    def get_workers(self):
+        return self.data.setdefault("workers", {})
+
+    def save_worker(self, ip, worker):
+        self.data.setdefault("workers", {})[ip] = worker
+        self.save()
+
+    def delete_worker(self, ip):
+        self.data.get("workers", {}).pop(ip, None)
+        self.save()
+
+    def update_worker_status(self, ip, status):
+        w = self.data.get("workers", {}).get(ip)
+        if w:
+            w["status"] = status
+            self.save()
 
 
 # ---------------------------------------------------------------------------
@@ -1587,6 +1607,468 @@ def api_dgx_ssh_test():
 
 
 # ---------------------------------------------------------------------------
+# DGX Worker Management — remote operations from head node
+# ---------------------------------------------------------------------------
+
+# Runtime status for worker installs (not persisted — only while running)
+_worker_install_lock = threading.Lock()
+_worker_installing = {}  # ip -> True while install is running
+
+
+def _ssh_cmd(user, ip, cmd, timeout=30):
+    """Run a command on a remote node via SSH."""
+    return runner.run(
+        "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no %s@%s 'bash -lc \"%s\"'" % (
+            user, ip, cmd.replace('"', '\\"')),
+        timeout=timeout)
+
+
+def _ssh_cmd_b64(user, ip, cmd, timeout=30):
+    """Run a complex command on a remote node via SSH using base64 encoding
+    to avoid shell escaping issues."""
+    encoded = base64.b64encode(cmd.encode()).decode()
+    return runner.run(
+        "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no %s@%s 'echo %s | base64 -d | bash -l'" % (
+            user, ip, encoded),
+        timeout=timeout)
+
+
+def _dgx_remote_run_step(msg, cmd, ip, user, timeout=1800):
+    """Run a single install step on remote worker via SSH, log output."""
+    log_queue.put("[WORKER %s] %s\n" % (ip, msg))
+    rc, out, err = _ssh_cmd_b64(user, ip, cmd, timeout=timeout)
+    if out.strip():
+        for line in out.strip().splitlines()[-5:]:
+            log_queue.put("[WORKER %s]   %s\n" % (ip, line))
+    if rc != 0:
+        error = err.strip() or out.strip() or "exit code %d" % rc
+        log_queue.put("[WORKER %s ERROR] %s\n" % (ip, error))
+        return False
+    return True
+
+
+def _install_vllm_dgx_remote(ip, user):
+    """Full DGX Spark installation on a remote worker node via SSH."""
+    install_dir = DGX_INSTALL_DIR_DEFAULT
+    venv_dir = install_dir + "/.vllm"
+    activate = "source %s/bin/activate" % venv_dir
+
+    log_queue.put("[WORKER %s] === Installazione remota vLLM per DGX Spark ===\n" % ip)
+    log_queue.put("[WORKER %s] Questa operazione richiede 20-40 minuti.\n" % ip)
+
+    # Step 1: Pre-flight checks
+    log_queue.put("[WORKER %s] Step 1/9: Controlli pre-installazione...\n" % ip)
+    rc, out, _ = _ssh_cmd(user, ip, "nvidia-smi --query-gpu=name --format=csv,noheader | head -1", timeout=15)
+    gpu_name = out.strip() if rc == 0 else "unknown"
+    log_queue.put("[WORKER %s]   GPU: %s\n" % (ip, gpu_name))
+    rc, out, _ = _ssh_cmd(user, ip, "nvcc --version 2>/dev/null || /usr/local/cuda/bin/nvcc --version 2>/dev/null", timeout=15)
+    if rc != 0:
+        log_queue.put("[WORKER %s ERROR] CUDA toolkit (nvcc) non trovato.\n" % ip)
+        return False
+    log_queue.put("[WORKER %s]   CUDA toolkit trovato\n" % ip)
+
+    # Step 2: Install uv package manager
+    if not _dgx_remote_run_step(
+        "Step 2/9: Installazione uv package manager...",
+        "command -v uv >/dev/null 2>&1 || (curl -LsSf https://astral.sh/uv/install.sh | sh) && "
+        "export PATH=\"$HOME/.local/bin:$PATH\" && uv --version",
+        ip, user,
+    ):
+        return False
+
+    # Step 3: Create Python venv
+    if not _dgx_remote_run_step(
+        "Step 3/9: Creazione virtualenv Python 3.12...",
+        "export PATH=\"$HOME/.local/bin:$PATH\" && "
+        "mkdir -p %s && cd %s && "
+        "uv venv .vllm --python 3.12" % (install_dir, install_dir),
+        ip, user,
+    ):
+        return False
+
+    # Step 4: Install PyTorch with CUDA 13.0
+    if not _dgx_remote_run_step(
+        "Step 4/9: Installazione PyTorch 2.9.0+cu130...",
+        "export PATH=\"$HOME/.local/bin:$PATH\" && "
+        "%s && "
+        "uv pip install torch torchvision torchaudio --index-url %s && "
+        "python -c \"import torch; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'GPU:', torch.cuda.is_available())\"" % (
+            activate, DGX_PYTORCH_INDEX),
+        ip, user, timeout=600,
+    ):
+        return False
+
+    # Step 5: Build Triton from source (sm_121a support)
+    triton_dir = install_dir + "/triton"
+    if not _dgx_remote_run_step(
+        "Step 5/9: Clone e build Triton da source (5-10 min)...",
+        "export PATH=\"$HOME/.local/bin:$PATH\" && "
+        "%s && "
+        "cd %s && "
+        "(test -d triton && cd triton && git fetch || git clone https://github.com/triton-lang/triton.git && cd triton) && "
+        "cd %s && "
+        "git checkout %s && "
+        "git submodule update --init --recursive && "
+        "uv pip install pip cmake ninja pybind11 && "
+        "export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas && "
+        "export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) && "
+        "python -m pip install --no-build-isolation -v . && "
+        "python -c \"import triton; print('Triton:', triton.__version__)\"" % (
+            activate, install_dir, triton_dir, DGX_TRITON_COMMIT),
+        ip, user, timeout=1800,
+    ):
+        return False
+
+    # Step 6: Install additional dependencies
+    if not _dgx_remote_run_step(
+        "Step 6/9: Installazione dipendenze (xgrammar, setuptools-scm, tvm)...",
+        "export PATH=\"$HOME/.local/bin:$PATH\" && "
+        "%s && "
+        "uv pip install xgrammar setuptools-scm apache-tvm-ffi==0.1.0b15 --prerelease=allow" % activate,
+        ip, user, timeout=300,
+    ):
+        return False
+
+    # Step 7: Clone vLLM
+    vllm_dir = install_dir + "/vllm"
+    if not _dgx_remote_run_step(
+        "Step 7/9: Clone vLLM repository...",
+        "cd %s && "
+        "(test -d vllm || git clone --recursive https://github.com/vllm-project/vllm.git) && "
+        "cd vllm && "
+        "git checkout %s && "
+        "git submodule update --init --recursive" % (install_dir, DGX_VLLM_COMMIT),
+        ip, user, timeout=300,
+    ):
+        return False
+
+    # Step 8: Apply critical patches for Blackwell sm_121
+    log_queue.put("[WORKER %s] Step 8/9: Applicazione patch per Blackwell sm_121...\n" % ip)
+
+    _dgx_remote_run_step(
+        "  Patch: pyproject.toml license field...",
+        "cd %s && "
+        "sed -i 's/^license = \"Apache-2.0\"$/license = {text = \"Apache-2.0\"}/' pyproject.toml && "
+        "sed -i '/^license-files = /d' pyproject.toml" % vllm_dir,
+        ip, user, timeout=10,
+    )
+
+    _dgx_remote_run_step(
+        "  Patch: CMakeLists.txt SM100/SM120 CUTLASS fix...",
+        "cd %s && "
+        "sed -i 's/cuda_archs_loose_intersection(SCALED_MM_ARCHS \"10.0f;11.0f\"/cuda_archs_loose_intersection(SCALED_MM_ARCHS \"10.0f;11.0f;12.0f\"/' CMakeLists.txt && "
+        "sed -i 's/cuda_archs_loose_intersection(SCALED_MM_ARCHS \"10.0a\"/cuda_archs_loose_intersection(SCALED_MM_ARCHS \"10.0a;12.1a\"/' CMakeLists.txt" % vllm_dir,
+        ip, user, timeout=10,
+    )
+
+    _dgx_remote_run_step(
+        "  Patch: flashinfer-python license cache...",
+        "find $HOME/.cache/uv/sdists-v9/pypi/flashinfer-python -name 'pyproject.toml' "
+        "-exec sed -i 's/^license = \"Apache-2.0\"$/license = {text = \"Apache-2.0\"}/' {} \\; "
+        "-exec sed -i '/^license-files = /d' {} \\; 2>/dev/null; true",
+        ip, user, timeout=10,
+    )
+
+    _dgx_remote_run_step(
+        "  Patch: use_existing_torch.py...",
+        "%s && cd %s && "
+        "python use_existing_torch.py 2>/dev/null || true" % (activate, vllm_dir),
+        ip, user, timeout=30,
+    )
+
+    # Step 9: Build vLLM
+    if not _dgx_remote_run_step(
+        "Step 9/9: Build vLLM con TORCH_CUDA_ARCH_LIST=12.1a (15-20 min)...",
+        "export PATH=\"$HOME/.local/bin:$PATH\" && "
+        "%s && "
+        "cd %s && "
+        "export TORCH_CUDA_ARCH_LIST=12.1a && "
+        "export VLLM_USE_FLASHINFER_MXFP4_MOE=1 && "
+        "export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas && "
+        "uv pip install --no-build-isolation --prerelease=allow -e ." % (activate, vllm_dir),
+        ip, user, timeout=2400,
+    ):
+        # Retry with flashinfer fix
+        log_queue.put("[WORKER %s] Retry: fix flashinfer e rebuild...\n" % ip)
+        if not _dgx_remote_run_step(
+            "  Fix flashinfer + retry build...",
+            "find $HOME/.cache/uv/sdists-v9/pypi/flashinfer-python -name 'pyproject.toml' "
+            "-exec sed -i 's/^license = \"Apache-2.0\"$/license = {text = \"Apache-2.0\"}/' {} \\; "
+            "-exec sed -i '/^license-files = /d' {} \\; 2>/dev/null; "
+            "export PATH=\"$HOME/.local/bin:$PATH\" && "
+            "%s && cd %s && "
+            "export TORCH_CUDA_ARCH_LIST=12.1a && "
+            "export VLLM_USE_FLASHINFER_MXFP4_MOE=1 && "
+            "export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas && "
+            "uv pip install --no-build-isolation --prerelease=allow -e ." % (activate, vllm_dir),
+            ip, user, timeout=2400,
+        ):
+            return False
+
+    # Create env activation script
+    _dgx_remote_run_step(
+        "Creazione script ambiente vllm_env.sh...",
+        "cat > %s/vllm_env.sh << 'ENVEOF'\n"
+        "#!/bin/bash\n"
+        "SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n"
+        "source \"$SCRIPT_DIR/.vllm/bin/activate\"\n"
+        "export TORCH_CUDA_ARCH_LIST=12.1a\n"
+        "export VLLM_USE_FLASHINFER_MXFP4_MOE=1\n"
+        "CUDA_PATH=$(ls -d /usr/local/cuda* 2>/dev/null | head -1)\n"
+        "export TRITON_PTXAS_PATH=\"$CUDA_PATH/bin/ptxas\"\n"
+        "export PATH=\"$CUDA_PATH/bin:$PATH\"\n"
+        "export LD_LIBRARY_PATH=\"$CUDA_PATH/lib64:$LD_LIBRARY_PATH\"\n"
+        "export TIKTOKEN_CACHE_DIR=\"$SCRIPT_DIR/.tiktoken_cache\"\n"
+        "mkdir -p \"$TIKTOKEN_CACHE_DIR\"\n"
+        "echo \"=== vLLM DGX Spark Environment Active ===\"\n"
+        "ENVEOF\n"
+        "chmod +x %s/vllm_env.sh" % (install_dir, install_dir),
+        ip, user, timeout=10,
+    )
+
+    # Verification
+    log_queue.put("[WORKER %s] Verifica installazione...\n" % ip)
+    rc, out, err = _ssh_cmd_b64(user, ip,
+        "%s && python -c \"import vllm; print('vLLM', vllm.__version__)\" && "
+        "python -c \"import torch; print('PyTorch', torch.__version__, 'CUDA', torch.version.cuda, 'GPU', torch.cuda.is_available())\"" % activate,
+        timeout=30)
+    if rc == 0:
+        for line in out.strip().splitlines():
+            log_queue.put("[WORKER %s]   %s\n" % (ip, line))
+        log_queue.put("[WORKER %s] === Installazione completata con successo! ===\n" % ip)
+        return True
+    else:
+        log_queue.put("[WORKER %s ERROR] Verifica fallita: %s\n" % (ip, err.strip() or out.strip()))
+        return False
+
+
+def _verify_worker(ip, user):
+    """Check GPU, vLLM, and Ray on a remote worker. Returns dict of results."""
+    activate = "source %s/.vllm/bin/activate" % DGX_INSTALL_DIR_DEFAULT
+    results = {}
+
+    # GPU check
+    rc, out, _ = _ssh_cmd(user, ip,
+        "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader", timeout=15)
+    results["gpu"] = {"ok": rc == 0 and bool(out.strip()), "info": out.strip() if rc == 0 else "non rilevata"}
+
+    # vLLM check
+    rc, out, _ = _ssh_cmd_b64(user, ip,
+        "%s && python -c \"import vllm; print(vllm.__version__)\"" % activate, timeout=30)
+    results["vllm"] = {"ok": rc == 0 and bool(out.strip()), "info": out.strip() if rc == 0 else "non installato"}
+
+    # Ray check
+    rc, out, _ = _ssh_cmd_b64(user, ip,
+        "%s && python -c \"import ray; print(ray.__version__)\"" % activate, timeout=15)
+    results["ray"] = {"ok": rc == 0 and bool(out.strip()), "info": out.strip() if rc == 0 else "non disponibile"}
+
+    return results
+
+
+# --- Worker API endpoints ---
+
+@app.route("/api/dgx/workers")
+def api_dgx_workers():
+    workers = dict(config.get_workers())
+    # Merge runtime install status
+    for ip, w in workers.items():
+        if _worker_installing.get(ip):
+            w["status"] = "installing"
+    return jsonify({"workers": workers})
+
+
+@app.route("/api/dgx/workers/add", methods=["POST"])
+def api_dgx_workers_add():
+    data = flask_request.json or {}
+    ip = data.get("ip", "").strip()
+    user = data.get("user", "root").strip()
+    alias = data.get("alias", "").strip()
+    if not ip:
+        return jsonify({"error": "IP mancante"}), 400
+    worker = {"ip": ip, "user": user, "alias": alias or ip, "status": "added"}
+    config.save_worker(ip, worker)
+    log_queue.put("[WORKER %s] Aggiunto (%s@%s)\n" % (ip, user, ip))
+    return jsonify({"status": "ok", "worker": worker})
+
+
+@app.route("/api/dgx/workers/remove", methods=["POST"])
+def api_dgx_workers_remove():
+    data = flask_request.json or {}
+    ip = data.get("ip", "").strip()
+    if not ip:
+        return jsonify({"error": "IP mancante"}), 400
+    if _worker_installing.get(ip):
+        return jsonify({"error": "Installazione in corso, impossibile rimuovere"}), 400
+    config.delete_worker(ip)
+    log_queue.put("[WORKER %s] Rimosso\n" % ip)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/dgx/workers/ssh-setup", methods=["POST"])
+def api_dgx_workers_ssh_setup():
+    data = flask_request.json or {}
+    ip = data.get("ip", "").strip()
+    if not ip:
+        return jsonify({"error": "IP mancante"}), 400
+    w = config.get_workers().get(ip)
+    if not w:
+        return jsonify({"error": "Worker non trovato"}), 404
+    user = w["user"]
+
+    def _run():
+        runner.run("test -f ~/.ssh/id_rsa || ssh-keygen -t rsa -b 4096 -N '' -f ~/.ssh/id_rsa", timeout=10)
+        rc, out, err = runner.run(
+            "ssh-copy-id -o StrictHostKeyChecking=no %s@%s" % (user, ip), timeout=30)
+        if rc == 0:
+            log_queue.put("[WORKER %s] Chiavi SSH copiate\n" % ip)
+            # Verify SSH works
+            rc2, out2, _ = runner.run(
+                "ssh -o ConnectTimeout=5 %s@%s 'hostname'" % (user, ip), timeout=15)
+            if rc2 == 0:
+                config.update_worker_status(ip, "ssh_ok")
+                log_queue.put("[WORKER %s] SSH verificato (host: %s)\n" % (ip, out2.strip()))
+            else:
+                config.update_worker_status(ip, "error")
+        else:
+            log_queue.put("[WORKER %s ERROR] SSH setup fallito: %s\n" % (ip, err.strip() or "errore"))
+            config.update_worker_status(ip, "error")
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "setting_up"})
+
+
+@app.route("/api/dgx/workers/ssh-test", methods=["POST"])
+def api_dgx_workers_ssh_test():
+    data = flask_request.json or {}
+    ip = data.get("ip", "").strip()
+    if not ip:
+        return jsonify({"error": "IP mancante"}), 400
+    w = config.get_workers().get(ip)
+    if not w:
+        return jsonify({"error": "Worker non trovato"}), 404
+    rc, out, err = runner.run(
+        "ssh -o ConnectTimeout=5 %s@%s 'hostname'" % (w["user"], ip), timeout=15)
+    if rc == 0:
+        config.update_worker_status(ip, "ssh_ok")
+        return jsonify({"status": "ok", "hostname": out.strip()})
+    return jsonify({"status": "fail", "error": err.strip() or "connessione fallita"})
+
+
+@app.route("/api/dgx/workers/install", methods=["POST"])
+def api_dgx_workers_install():
+    data = flask_request.json or {}
+    ip = data.get("ip", "").strip()
+    if not ip:
+        return jsonify({"error": "IP mancante"}), 400
+    w = config.get_workers().get(ip)
+    if not w:
+        return jsonify({"error": "Worker non trovato"}), 404
+
+    with _worker_install_lock:
+        if any(_worker_installing.values()):
+            return jsonify({"error": "Un'altra installazione e' gia' in corso. Attendi il completamento."}), 409
+        _worker_installing[ip] = True
+
+    config.update_worker_status(ip, "installing")
+
+    def _run():
+        try:
+            success = _install_vllm_dgx_remote(ip, w["user"])
+            if success:
+                config.update_worker_status(ip, "installed")
+            else:
+                config.update_worker_status(ip, "error")
+        finally:
+            _worker_installing[ip] = False
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "installing"})
+
+
+@app.route("/api/dgx/workers/verify", methods=["POST"])
+def api_dgx_workers_verify():
+    data = flask_request.json or {}
+    ip = data.get("ip", "").strip()
+    if not ip:
+        return jsonify({"error": "IP mancante"}), 400
+    w = config.get_workers().get(ip)
+    if not w:
+        return jsonify({"error": "Worker non trovato"}), 404
+
+    results = _verify_worker(ip, w["user"])
+    all_ok = all(r["ok"] for r in results.values())
+    if all_ok:
+        config.update_worker_status(ip, "ready")
+        log_queue.put("[WORKER %s] Verifica OK: GPU=%s, vLLM=%s, Ray=%s\n" % (
+            ip, results["gpu"]["info"], results["vllm"]["info"], results["ray"]["info"]))
+    else:
+        failed = [k for k, v in results.items() if not v["ok"]]
+        log_queue.put("[WORKER %s] Verifica FALLITA: %s\n" % (ip, ", ".join(failed)))
+    return jsonify({"status": "ok" if all_ok else "fail", "results": results})
+
+
+@app.route("/api/dgx/ray/start-cluster", methods=["POST"])
+def api_dgx_ray_start_cluster():
+    """Start Ray head on this node, then connect all ready workers."""
+    def _run():
+        # Start head
+        rc, out, err = runner.run(
+            "ray start --head --port=6379 --dashboard-host=0.0.0.0", timeout=30)
+        if rc != 0:
+            log_queue.put("[RAY ERROR] Head start fallito: %s\n" % (err.strip() or out.strip()))
+            return
+        log_queue.put("[RAY] Head node avviato.\n")
+
+        # Get head IP
+        rc, head_ip, _ = runner.run("hostname -I | awk '{print $1}'", timeout=5)
+        head_ip = head_ip.strip()
+        if not head_ip:
+            log_queue.put("[RAY ERROR] Impossibile determinare IP head.\n")
+            return
+
+        # Connect each ready/installed worker
+        workers = config.get_workers()
+        connected = 0
+        for ip, w in workers.items():
+            if w.get("status") not in ("ready", "installed"):
+                log_queue.put("[RAY] Skip worker %s (stato: %s)\n" % (ip, w.get("status", "?")))
+                continue
+            log_queue.put("[RAY] Connessione worker %s...\n" % ip)
+            activate = "source %s/.vllm/bin/activate" % DGX_INSTALL_DIR_DEFAULT
+            rc, out, err = _ssh_cmd_b64(w["user"], ip,
+                "%s && ray start --address=%s:6379" % (activate, head_ip), timeout=30)
+            if rc == 0:
+                config.update_worker_status(ip, "ray_connected")
+                log_queue.put("[RAY] Worker %s connesso.\n" % ip)
+                connected += 1
+            else:
+                log_queue.put("[RAY ERROR] Worker %s: %s\n" % (ip, err.strip() or out.strip()))
+
+        log_queue.put("[RAY] Cluster avviato: head + %d worker connessi.\n" % connected)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "starting"})
+
+
+@app.route("/api/dgx/ray/stop-cluster", methods=["POST"])
+def api_dgx_ray_stop_cluster():
+    """Stop Ray on all workers (via SSH), then stop local head."""
+    def _run():
+        workers = config.get_workers()
+        # Stop workers first
+        for ip, w in workers.items():
+            if w.get("status") == "ray_connected":
+                log_queue.put("[RAY] Stop worker %s...\n" % ip)
+                activate = "source %s/.vllm/bin/activate" % DGX_INSTALL_DIR_DEFAULT
+                _ssh_cmd_b64(w["user"], ip, "%s && ray stop" % activate, timeout=15)
+                config.update_worker_status(ip, "ready")
+        # Stop head
+        runner.run("ray stop", timeout=15)
+        log_queue.put("[RAY] Cluster fermato.\n")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "stopping"})
+
+
+# ---------------------------------------------------------------------------
 # HTML Template
 # ---------------------------------------------------------------------------
 
@@ -2030,6 +2512,36 @@ select { cursor: pointer; }
     </div>
   </div>
 
+  <!-- Worker Management -->
+  <div class="card">
+    <h3>Gestione Worker Remoti</h3>
+    <p style="font-size:12px;color:var(--fg3);margin-bottom:8px">Aggiungi i nodi worker e gestiscili interamente da qui (SSH, installazione vLLM, Ray).</p>
+    <div class="form-row three" style="margin-bottom:8px">
+      <div>
+        <label>IP Worker</label>
+        <input type="text" id="dgx-add-ip" placeholder="192.168.1.x">
+      </div>
+      <div>
+        <label>User SSH</label>
+        <input type="text" id="dgx-add-user" value="root">
+      </div>
+      <div>
+        <label>Alias (opzionale)</label>
+        <input type="text" id="dgx-add-alias" placeholder="dgx-worker-1">
+      </div>
+    </div>
+    <button class="btn btn-primary" onclick="dgxAddWorker()" style="margin-bottom:12px">+ Aggiungi Worker</button>
+
+    <div id="dgx-workers-table-wrap">
+      <table class="data-table" id="dgx-workers-table">
+        <thead><tr><th>IP</th><th>User</th><th>Alias</th><th>Stato</th><th>Azioni</th></tr></thead>
+        <tbody id="dgx-workers-body">
+          <tr><td colspan="5" style="text-align:center;color:var(--fg3)">Nessun worker configurato</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- Node Discovery & Network -->
   <div class="card">
     <h3>Node Discovery & Network</h3>
@@ -2067,22 +2579,12 @@ select { cursor: pointer; }
   <!-- Ray Cluster -->
   <div class="card">
     <h3>Ray Cluster</h3>
-    <div class="btn-row" style="margin-bottom:8px">
-      <button class="btn btn-success" onclick="dgxRayStartHead()">Avvia Ray Head</button>
-      <button class="btn btn-primary" onclick="dgxRayConnectWorker()">Connetti Worker</button>
-      <button class="btn btn-danger" onclick="dgxRayStop()">Stop Ray</button>
-    </div>
     <div id="dgx-ray-status" style="font-size:13px;margin-bottom:8px;color:var(--fg2)">Ray: sconosciuto</div>
-    <div class="form-row">
-      <div>
-        <label>Worker IP</label>
-        <input type="text" id="dgx-worker-ip" placeholder="192.168.1.x">
-      </div>
-      <div>
-        <label>User</label>
-        <input type="text" id="dgx-worker-user" value="root">
-      </div>
+    <div class="btn-row">
+      <button class="btn btn-success" onclick="dgxStartCluster()">Avvia Cluster Ray (Head + Worker)</button>
+      <button class="btn btn-danger" onclick="dgxStopCluster()">Stop Cluster Ray</button>
     </div>
+    <p style="font-size:11px;color:var(--fg3);margin-top:6px">Avvia Ray head su questo nodo e connette automaticamente tutti i worker con stato "pronto" o "installato".</p>
   </div>
 
   <!-- Multi-Node Inference -->
@@ -2124,26 +2626,6 @@ select { cursor: pointer; }
       </tbody>
     </table>
     <button class="btn btn-success" style="margin-top:8px" onclick="dgxStartMultiNode()">Start Multi-Node Server</button>
-  </div>
-
-  <!-- SSH Configuration -->
-  <div class="card">
-    <h3>SSH Configuration</h3>
-    <div class="form-row">
-      <div>
-        <label>Target IP</label>
-        <input type="text" id="dgx-ssh-ip" placeholder="192.168.1.x">
-      </div>
-      <div>
-        <label>User</label>
-        <input type="text" id="dgx-ssh-user" value="root">
-      </div>
-    </div>
-    <div class="btn-row" style="margin-top:4px">
-      <button class="btn btn-secondary" onclick="dgxSSHSetup()">Setup SSH Keys</button>
-      <button class="btn btn-secondary" onclick="dgxSSHTest()">Test Connessione</button>
-      <span id="dgx-ssh-status" style="font-size:12px;color:var(--fg3);align-self:center"></span>
-    </div>
   </div>
 </div>
 {% endif %}
@@ -2593,6 +3075,127 @@ async function deleteProfile() {
 refreshProfiles();
 
 // --- DGX Spark ---
+const DGX_STATUS_LABELS = {
+  'added': {label: 'Aggiunto', color: '#888'},
+  'ssh_ok': {label: 'SSH OK', color: '#5b9bd5'},
+  'installing': {label: 'Installazione...', color: '#e6a817'},
+  'installed': {label: 'Installato', color: '#d48806'},
+  'ready': {label: 'Pronto', color: '#52c41a'},
+  'ray_connected': {label: 'Ray Connesso', color: '#00d46a'},
+  'error': {label: 'Errore', color: '#e74c3c'},
+};
+
+function dgxStatusBadge(status) {
+  const s = DGX_STATUS_LABELS[status] || {label: status, color: '#888'};
+  const pulse = status === 'installing' ? 'animation:pulse 1.5s infinite;' : '';
+  return '<span style="display:inline-flex;align-items:center;gap:4px;font-size:12px;' + pulse + '">' +
+    '<span style="width:8px;height:8px;border-radius:50%;background:' + s.color + ';display:inline-block"></span>' +
+    s.label + '</span>';
+}
+
+function dgxWorkerActions(ip, status) {
+  const btns = [];
+  const sm = 'style="font-size:11px;padding:2px 8px"';
+  if (status === 'added') {
+    btns.push('<button class="btn btn-primary" ' + sm + ' onclick="dgxWorkerSSHSetup(\'' + ip + '\')">Setup SSH</button>');
+  }
+  if (status === 'ssh_ok') {
+    btns.push('<button class="btn btn-success" ' + sm + ' onclick="dgxWorkerInstall(\'' + ip + '\')">Installa vLLM</button>');
+    btns.push('<button class="btn btn-secondary" ' + sm + ' onclick="dgxWorkerVerify(\'' + ip + '\')">Verifica</button>');
+  }
+  if (status === 'installed') {
+    btns.push('<button class="btn btn-secondary" ' + sm + ' onclick="dgxWorkerVerify(\'' + ip + '\')">Verifica</button>');
+  }
+  if (status === 'error') {
+    btns.push('<button class="btn btn-primary" ' + sm + ' onclick="dgxWorkerSSHSetup(\'' + ip + '\')">Riprova SSH</button>');
+    btns.push('<button class="btn btn-success" ' + sm + ' onclick="dgxWorkerInstall(\'' + ip + '\')">Riprova Installa</button>');
+  }
+  if (status !== 'installing' && status !== 'ray_connected') {
+    btns.push('<button class="btn btn-danger" ' + sm + ' onclick="dgxWorkerRemove(\'' + ip + '\')">Rimuovi</button>');
+  }
+  if (status === 'ready' || status === 'ray_connected') {
+    btns.push('<button class="btn btn-secondary" ' + sm + ' onclick="dgxWorkerVerify(\'' + ip + '\')">Verifica</button>');
+  }
+  return btns.join(' ');
+}
+
+let _dgxPollTimer = null;
+
+async function dgxLoadWorkers() {
+  try {
+    const data = await apiGet('/api/dgx/workers');
+    const workers = data.workers || {};
+    const keys = Object.keys(workers);
+    const tbody = document.getElementById('dgx-workers-body');
+    if (keys.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--fg3)">Nessun worker configurato</td></tr>';
+    } else {
+      tbody.innerHTML = keys.map(ip => {
+        const w = workers[ip];
+        return '<tr>' +
+          '<td>' + w.ip + '</td>' +
+          '<td>' + w.user + '</td>' +
+          '<td>' + (w.alias || '') + '</td>' +
+          '<td>' + dgxStatusBadge(w.status) + '</td>' +
+          '<td>' + dgxWorkerActions(w.ip, w.status) + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+    // Auto-poll faster while any worker is installing
+    const anyInstalling = keys.some(ip => workers[ip].status === 'installing');
+    clearInterval(_dgxPollTimer);
+    _dgxPollTimer = setInterval(dgxLoadWorkers, anyInstalling ? 5000 : 15000);
+  } catch(e) {}
+}
+
+async function dgxAddWorker() {
+  const ip = document.getElementById('dgx-add-ip').value.trim();
+  const user = document.getElementById('dgx-add-user').value.trim() || 'root';
+  const alias = document.getElementById('dgx-add-alias').value.trim();
+  if (!ip) { showToast('Inserisci IP del worker', 'error'); return; }
+  await apiPost('/api/dgx/workers/add', {ip, user, alias});
+  document.getElementById('dgx-add-ip').value = '';
+  document.getElementById('dgx-add-alias').value = '';
+  showToast('Worker ' + ip + ' aggiunto', 'success');
+  dgxLoadWorkers();
+}
+
+async function dgxWorkerRemove(ip) {
+  if (!confirm('Rimuovere il worker ' + ip + '?')) return;
+  const data = await apiPost('/api/dgx/workers/remove', {ip});
+  if (data.error) { showToast(data.error, 'error'); return; }
+  showToast('Worker ' + ip + ' rimosso', 'success');
+  dgxLoadWorkers();
+}
+
+async function dgxWorkerSSHSetup(ip) {
+  showToast('Setup SSH verso ' + ip + '...', '');
+  await apiPost('/api/dgx/workers/ssh-setup', {ip});
+  showToast('Setup SSH avviato, controlla i log', 'success');
+  setTimeout(dgxLoadWorkers, 3000);
+}
+
+async function dgxWorkerInstall(ip) {
+  if (!confirm('Installare vLLM su ' + ip + '? L\'operazione richiede 20-40 minuti.')) return;
+  const data = await apiPost('/api/dgx/workers/install', {ip});
+  if (data.error) { showToast(data.error, 'error'); return; }
+  showToast('Installazione avviata su ' + ip + ' — segui nei Log', 'success');
+  dgxLoadWorkers();
+}
+
+async function dgxWorkerVerify(ip) {
+  showToast('Verifica worker ' + ip + '...', '');
+  const data = await apiPost('/api/dgx/workers/verify', {ip});
+  if (data.status === 'ok') {
+    showToast('Worker ' + ip + ': tutto OK', 'success');
+  } else {
+    const r = data.results || {};
+    const fails = Object.keys(r).filter(k => !r[k].ok).map(k => k + ': ' + r[k].info);
+    showToast('Worker ' + ip + ' — problemi: ' + fails.join(', '), 'error');
+  }
+  dgxLoadWorkers();
+}
+
 async function refreshDGXCluster() {
   document.getElementById('dgx-cluster-status').textContent = 'Rilevamento...';
   try {
@@ -2637,26 +3240,22 @@ async function dgxApplyEnv() {
   showToast('Variabili ambiente aggiornate', 'success');
 }
 
-async function dgxRayStartHead() {
-  await apiPost('/api/dgx/ray/start-head');
-  document.getElementById('dgx-ray-status').textContent = 'Ray: avvio head in corso...';
-  showToast('Avvio Ray head...', 'success');
-  setTimeout(refreshDGXCluster, 5000);
+async function dgxStartCluster() {
+  showToast('Avvio cluster Ray (head + worker)...', 'success');
+  document.getElementById('dgx-ray-status').textContent = 'Ray: avvio cluster in corso...';
+  await apiPost('/api/dgx/ray/start-cluster');
+  setTimeout(() => { refreshDGXCluster(); dgxLoadWorkers(); }, 8000);
 }
 
-async function dgxRayConnectWorker() {
-  const ip = document.getElementById('dgx-worker-ip').value.trim();
-  const user = document.getElementById('dgx-worker-user').value.trim();
-  if (!ip) { showToast('Inserisci IP del worker', 'error'); return; }
-  await apiPost('/api/dgx/ray/connect-worker', {ip, user});
-  document.getElementById('dgx-ray-status').textContent = 'Ray: connessione worker ' + ip + '...';
-  showToast('Connessione worker ' + ip + '...', 'success');
-}
-
-async function dgxRayStop() {
-  await apiPost('/api/dgx/ray/stop');
-  document.getElementById('dgx-ray-status').textContent = 'Ray: fermato';
-  showToast('Ray fermato', 'success');
+async function dgxStopCluster() {
+  showToast('Stop cluster Ray...', '');
+  document.getElementById('dgx-ray-status').textContent = 'Ray: arresto in corso...';
+  await apiPost('/api/dgx/ray/stop-cluster');
+  setTimeout(() => {
+    document.getElementById('dgx-ray-status').textContent = 'Ray: fermato';
+    refreshDGXCluster();
+    dgxLoadWorkers();
+  }, 3000);
 }
 
 async function dgxStartMultiNode() {
@@ -2678,31 +3277,9 @@ async function dgxStartMultiNode() {
   switchTab('server');
 }
 
-async function dgxSSHSetup() {
-  const ip = document.getElementById('dgx-ssh-ip').value.trim();
-  const user = document.getElementById('dgx-ssh-user').value.trim();
-  if (!ip) { showToast('Inserisci IP target', 'error'); return; }
-  document.getElementById('dgx-ssh-status').textContent = 'Configurazione SSH...';
-  await apiPost('/api/dgx/ssh/setup', {ip, user});
-  document.getElementById('dgx-ssh-status').textContent = 'Setup avviato, controlla i log.';
-}
-
-async function dgxSSHTest() {
-  const ip = document.getElementById('dgx-ssh-ip').value.trim();
-  const user = document.getElementById('dgx-ssh-user').value.trim();
-  if (!ip) { showToast('Inserisci IP target', 'error'); return; }
-  document.getElementById('dgx-ssh-status').textContent = 'Test connessione...';
-  const data = await apiPost('/api/dgx/ssh/test', {ip, user});
-  if (data.status === 'ok') {
-    document.getElementById('dgx-ssh-status').textContent = 'OK: connesso a ' + data.hostname + ' (' + ip + ')';
-  } else {
-    document.getElementById('dgx-ssh-status').textContent = 'FAIL: ' + (data.error || 'connessione fallita');
-  }
-}
-
-// Auto-load DGX cluster on page load if DGX
+// Auto-load DGX on page load
 if (document.getElementById('tab-dgx')) {
-  setTimeout(refreshDGXCluster, 1500);
+  setTimeout(() => { refreshDGXCluster(); dgxLoadWorkers(); }, 1500);
 }
 </script>
 </body>
