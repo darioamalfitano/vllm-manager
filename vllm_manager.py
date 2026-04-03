@@ -563,16 +563,12 @@ def get_preset_models(platform_info: PlatformInfo) -> list:
         ]
     elif platform_info.os == "macos":
         return [
-            {"name": "Qwen/Qwen2.5-1.5B-Instruct", "vram": "~3 GB",
-             "note": "Test veloce", "chat_template": ""},
-            {"name": "Qwen/Qwen2.5-7B-Instruct", "vram": "~14 GB",
-             "note": "Buon bilanciamento", "chat_template": ""},
-            {"name": "meta-llama/Llama-3.2-3B-Instruct", "vram": "~6 GB",
-             "note": "Llama 3.2 compatto", "chat_template": ""},
-            {"name": "mlx-community/Llama-3.2-3B-Instruct-4bit", "vram": "~2 GB",
-             "note": "MLX quantizzato 4-bit", "chat_template": ""},
+            {"name": "mlx-community/Qwen2.5-1.5B-Instruct-4bit", "vram": "~2 GB",
+             "note": "Test veloce (MLX 4-bit)", "chat_template": ""},
             {"name": "mlx-community/Qwen2.5-7B-Instruct-4bit", "vram": "~4 GB",
-             "note": "MLX quantizzato 4-bit", "chat_template": ""},
+             "note": "Buon bilanciamento (MLX 4-bit)", "chat_template": ""},
+            {"name": "mlx-community/Llama-3.2-3B-Instruct-4bit", "vram": "~2 GB",
+             "note": "Llama 3.2 compatto (MLX 4-bit)", "chat_template": ""},
         ]
     else:
         # Windows WSL / Linux with typical 16-24 GB VRAM
@@ -1496,7 +1492,7 @@ class App(tk.Tk):
         _draw_line(list(self.gpu_mon.history_temp), "#ef4444")
 
         y0 = 12
-        for label, color in [("%s %%" % vram_label, "#3b82f6"),
+        for label, color in [("%s %%" % self.platform.vram_label, "#3b82f6"),
                               ("Util %", "#22c55e"),
                               ("Temp", "#ef4444")]:
             c.create_rectangle(8, y0 - 4, 20, y0 + 4, fill=color, outline=color)

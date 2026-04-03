@@ -1,6 +1,6 @@
-# vLLM Manager — Cross-Platform Desktop App
+# vLLM Manager — Cross-Platform Desktop & Web App
 
-App desktop (Python + tkinter) per gestire server vLLM su qualsiasi piattaforma.
+App desktop (Python + tkinter) e web (Python + Flask) per gestire server vLLM su qualsiasi piattaforma.
 
 ## Piattaforme supportate
 
@@ -15,9 +15,17 @@ App desktop (Python + tkinter) per gestire server vLLM su qualsiasi piattaforma.
 
 ## Avvio
 
+### Desktop (tkinter)
 ```bash
 python vllm_manager.py
 ```
+
+### Web (accesso remoto via browser)
+```bash
+pip install flask
+python vllm_manager_web.py --host 0.0.0.0 --port 5000
+```
+Poi apri `http://<ip-server>:5000` nel browser. Ideale per macchine remote accessibili solo via SSH.
 
 La piattaforma viene rilevata automaticamente all'avvio.
 
@@ -176,11 +184,20 @@ Poi apri `http://localhost:3000`
 
 ## Architettura tecnica
 
-- **Single file**: `vllm_manager.py` (Python + tkinter, solo stdlib)
-- **Cross-platform**: PlatformInfo (auto-detect), CommandRunner (WSL/Native/DGX), GpuMonitor (Nvidia/AppleSilicon), VLLMDetector (auto-find backend)
-- **Backend**: VLLMProcess (ciclo vita server), VLLMApi (client HTTP urllib), ConfigManager (profili JSON)
+### Desktop (`vllm_manager.py`)
+- **Single file**: Python + tkinter, solo stdlib
 - **Threading**: operazioni lunghe in thread daemon, comunicazione thread->UI via `queue.Queue` + `root.after()`
 - **Polling**: GPU ogni 2s, log ogni 250ms, status server ogni 5s
+
+### Web (`vllm_manager_web.py`)
+- **Single file**: Python + Flask (unica dipendenza esterna)
+- **REST API**: tutti i controlli esposti come endpoint JSON (`/api/server/*`, `/api/gpu`, `/api/models/*`, etc.)
+- **SSE (Server-Sent Events)**: log in tempo reale senza polling via `/api/logs/stream`
+- **Frontend**: HTML/CSS/JS embedded, dark theme, responsive
+
+### Comune
+- **Cross-platform**: PlatformInfo (auto-detect), CommandRunner (WSL/Native/DGX), GpuMonitor (Nvidia/AppleSilicon), VLLMDetector (auto-find backend)
+- **Backend**: VLLMProcess (ciclo vita server), VLLMApi (client HTTP urllib), ConfigManager (profili JSON)
 
 ---
 
