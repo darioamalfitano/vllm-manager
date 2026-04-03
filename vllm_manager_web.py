@@ -409,6 +409,7 @@ class VLLMDetector:
 
     def _detect_cuda(self):
         candidates = [
+            os.path.expanduser("~/vllm-install/.vllm"),
             os.path.expanduser("~/local-venv"),
             "/root/vllm-env",
             os.path.expanduser("~/vllm-env"),
@@ -642,8 +643,14 @@ class VLLMProcess:
         self.log_queue.put("[CMD] %s\n" % cmd)
 
         env = None
-        if self.platform.is_dgx and isinstance(self.runner, DGXCommandRunner):
-            env = dict(self.runner.dgx_env)
+        if self.platform.is_dgx:
+            env = {}
+            if isinstance(self.runner, DGXCommandRunner):
+                env.update(self.runner.dgx_env)
+            # Blackwell sm_121 env vars
+            env["TORCH_CUDA_ARCH_LIST"] = "12.1a"
+            env["VLLM_USE_FLASHINFER_MXFP4_MOE"] = "1"
+            env["TRITON_PTXAS_PATH"] = "/usr/local/cuda/bin/ptxas"
             if attention_backend:
                 env["VLLM_ATTENTION_BACKEND"] = attention_backend
 
@@ -897,47 +904,270 @@ def api_server_status():
 @app.route("/api/server/install", methods=["POST"])
 def api_install_vllm():
     def _install():
-        if platform_info.os == "macos":
-            venv = os.path.expanduser("~/vllm-env")
-            steps = [
-                ("Creazione virtualenv...", "%s -m venv %s" % (sys.executable, venv)),
+        if platform_info.is_dgx:
+            _install_vllm_dgx()
+        elif platform_info.os == "macos":
+            _install_vllm_simple([
+                ("Creazione virtualenv...",
+                 "%s -m venv %s" % (sys.executable, os.path.expanduser("~/vllm-env"))),
                 ("Installazione vllm-mlx...",
-                 "source %s/bin/activate && pip install --upgrade pip && pip install vllm-mlx" % venv),
-            ]
-        elif platform_info.is_dgx:
-            venv = os.path.expanduser("~/vllm-env")
-            steps = [
-                ("Creazione virtualenv...", "%s -m venv %s" % (sys.executable, venv)),
-                ("Installazione PyTorch nightly ARM64...",
-                 "source %s/bin/activate && pip install --upgrade pip && "
-                 "pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128" % venv),
-                ("Clone vLLM...", "cd /tmp && git clone https://github.com/vllm-project/vllm.git 2>/dev/null || true"),
-                ("Build vLLM sm_121...",
-                 "source %s/bin/activate && cd /tmp/vllm && "
-                 "TORCH_CUDA_ARCH_LIST='12.1' pip install -e ." % venv),
-            ]
+                 "source ~/vllm-env/bin/activate && pip install --upgrade pip && pip install vllm-mlx"),
+            ])
         else:
-            venv = os.path.expanduser("~/vllm-env")
-            steps = [
-                ("Creazione virtualenv...", "%s -m venv %s" % (sys.executable, venv)),
+            _install_vllm_simple([
+                ("Creazione virtualenv...",
+                 "%s -m venv %s" % (sys.executable, os.path.expanduser("~/vllm-env"))),
                 ("Installazione vLLM...",
-                 "source %s/bin/activate && pip install --upgrade pip && pip install vllm" % venv),
-            ]
-
-        for msg, cmd in steps:
-            log_queue.put("[INSTALL] %s\n" % msg)
-            rc, out, err = runner.run(cmd, timeout=600)
-            if rc != 0:
-                log_queue.put("[ERROR] %s\n" % (err.strip() or out.strip() or "exit code %d" % rc))
-                return
-            if out.strip():
-                for line in out.strip().splitlines()[-3:]:
-                    log_queue.put("[INSTALL]   %s\n" % line)
-        log_queue.put("[INSTALL] Installazione completata!\n")
-        detector.detect()
+                 "source ~/vllm-env/bin/activate && pip install --upgrade pip && pip install vllm"),
+            ])
 
     threading.Thread(target=_install, daemon=True).start()
     return jsonify({"status": "installing"})
+
+
+def _install_vllm_simple(steps):
+    """Simple pip-based install for Linux/macOS/WSL."""
+    for msg, cmd in steps:
+        log_queue.put("[INSTALL] %s\n" % msg)
+        rc, out, err = runner.run(cmd, timeout=600)
+        if rc != 0:
+            log_queue.put("[ERROR] %s\n" % (err.strip() or out.strip() or "exit code %d" % rc))
+            return
+        if out.strip():
+            for line in out.strip().splitlines()[-3:]:
+                log_queue.put("[INSTALL]   %s\n" % line)
+    log_queue.put("[INSTALL] Installazione completata!\n")
+    detector.detect()
+
+
+# ---------------------------------------------------------------------------
+# DGX Spark full installation (based on eelbaz/dgx-spark-vllm-setup)
+# Handles: uv, PyTorch cu130, Triton from source, vLLM patched for sm_121
+# ---------------------------------------------------------------------------
+
+# Pinned versions tested on DGX Spark GB10
+DGX_VLLM_COMMIT = "66a168a197ba214a5b70a74fa2e713c9eeb3251a"
+DGX_TRITON_COMMIT = "4caa0328bf8df64896dd5f6fb9df41b0eb2e750a"
+DGX_PYTORCH_INDEX = "https://download.pytorch.org/whl/cu130"
+DGX_INSTALL_DIR_DEFAULT = os.path.expanduser("~/vllm-install")
+
+
+def _dgx_run_step(msg, cmd, timeout=1800):
+    """Run a single install step, log output, return True on success."""
+    log_queue.put("[INSTALL] %s\n" % msg)
+    rc, out, err = runner.run(cmd, timeout=timeout)
+    if out.strip():
+        for line in out.strip().splitlines()[-5:]:
+            log_queue.put("[INSTALL]   %s\n" % line)
+    if rc != 0:
+        error = err.strip() or out.strip() or "exit code %d" % rc
+        log_queue.put("[ERROR] %s\n" % error)
+        return False
+    return True
+
+
+def _install_vllm_dgx():
+    """Full DGX Spark installation: uv, PyTorch, Triton, patched vLLM."""
+    install_dir = DGX_INSTALL_DIR_DEFAULT
+    venv_dir = install_dir + "/.vllm"
+    activate = "source %s/bin/activate" % venv_dir
+
+    log_queue.put("[INSTALL] === Installazione vLLM per DGX Spark (Blackwell GB10) ===\n")
+    log_queue.put("[INSTALL] Directory: %s\n" % install_dir)
+    log_queue.put("[INSTALL] Questa operazione richiede 20-30 minuti.\n")
+
+    # Step 1: Pre-flight checks
+    log_queue.put("[INSTALL] Step 1/9: Controlli pre-installazione...\n")
+    rc, out, _ = runner.run("nvidia-smi --query-gpu=name --format=csv,noheader | head -1", timeout=10)
+    gpu_name = out.strip() if rc == 0 else "unknown"
+    log_queue.put("[INSTALL]   GPU: %s\n" % gpu_name)
+    rc, out, _ = runner.run("nvcc --version 2>/dev/null || /usr/local/cuda/bin/nvcc --version 2>/dev/null", timeout=10)
+    if rc != 0:
+        log_queue.put("[ERROR] CUDA toolkit (nvcc) non trovato. Installa CUDA 13.0+\n")
+        return
+    log_queue.put("[INSTALL]   CUDA toolkit trovato\n")
+    rc, out, _ = runner.run("df -BG $HOME | tail -1 | awk '{print $4}' | sed 's/G//'", timeout=5)
+    free_gb = int(out.strip()) if rc == 0 and out.strip().isdigit() else 0
+    if free_gb < 50:
+        log_queue.put("[WARNING] Spazio disco basso: %d GB (consigliati 50 GB)\n" % free_gb)
+
+    # Step 2: Install uv package manager
+    if not _dgx_run_step(
+        "Step 2/9: Installazione uv package manager...",
+        "command -v uv >/dev/null 2>&1 || (curl -LsSf https://astral.sh/uv/install.sh | sh) && "
+        "export PATH=\"$HOME/.local/bin:$PATH\" && uv --version"
+    ):
+        return
+
+    # Step 3: Create Python venv
+    if not _dgx_run_step(
+        "Step 3/9: Creazione virtualenv Python 3.12...",
+        "export PATH=\"$HOME/.local/bin:$PATH\" && "
+        "mkdir -p %s && cd %s && "
+        "uv venv .vllm --python 3.12" % (install_dir, install_dir)
+    ):
+        return
+
+    # Step 4: Install PyTorch with CUDA 13.0
+    if not _dgx_run_step(
+        "Step 4/9: Installazione PyTorch 2.9.0+cu130...",
+        "export PATH=\"$HOME/.local/bin:$PATH\" && "
+        "%s && "
+        "uv pip install torch torchvision torchaudio --index-url %s && "
+        "python -c \"import torch; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'GPU:', torch.cuda.is_available())\"" % (
+            activate, DGX_PYTORCH_INDEX),
+        timeout=600,
+    ):
+        return
+
+    # Step 5: Build Triton from source (sm_121a support)
+    triton_dir = install_dir + "/triton"
+    if not _dgx_run_step(
+        "Step 5/9: Clone e build Triton da source (5-10 min)...",
+        "export PATH=\"$HOME/.local/bin:$PATH\" && "
+        "%s && "
+        "cd %s && "
+        "(test -d triton && cd triton && git fetch || git clone https://github.com/triton-lang/triton.git && cd triton) && "
+        "cd %s && "
+        "git checkout %s && "
+        "git submodule update --init --recursive && "
+        "uv pip install pip cmake ninja pybind11 && "
+        "export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas && "
+        "export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) && "
+        "python -m pip install --no-build-isolation -v . && "
+        "python -c \"import triton; print('Triton:', triton.__version__)\"" % (
+            activate, install_dir, triton_dir, DGX_TRITON_COMMIT),
+        timeout=1800,
+    ):
+        return
+
+    # Step 6: Install additional dependencies
+    if not _dgx_run_step(
+        "Step 6/9: Installazione dipendenze (xgrammar, setuptools-scm, tvm)...",
+        "export PATH=\"$HOME/.local/bin:$PATH\" && "
+        "%s && "
+        "uv pip install xgrammar setuptools-scm apache-tvm-ffi==0.1.0b15 --prerelease=allow" % activate,
+        timeout=300,
+    ):
+        return
+
+    # Step 7: Clone vLLM
+    vllm_dir = install_dir + "/vllm"
+    if not _dgx_run_step(
+        "Step 7/9: Clone vLLM repository...",
+        "cd %s && "
+        "(test -d vllm || git clone --recursive https://github.com/vllm-project/vllm.git) && "
+        "cd vllm && "
+        "git checkout %s && "
+        "git submodule update --init --recursive" % (install_dir, DGX_VLLM_COMMIT),
+        timeout=300,
+    ):
+        return
+
+    # Step 8: Apply critical patches for Blackwell sm_121
+    log_queue.put("[INSTALL] Step 8/9: Applicazione patch per Blackwell sm_121...\n")
+
+    # 8a. Fix pyproject.toml license field
+    _dgx_run_step(
+        "  Patch: pyproject.toml license field...",
+        "cd %s && "
+        "sed -i 's/^license = \"Apache-2.0\"$/license = {text = \"Apache-2.0\"}/' pyproject.toml && "
+        "sed -i '/^license-files = /d' pyproject.toml" % vllm_dir,
+        timeout=10,
+    )
+
+    # 8b. CMakeLists.txt — add SM100/SM120/SM121 to CUTLASS kernel archs
+    _dgx_run_step(
+        "  Patch: CMakeLists.txt SM100/SM120 CUTLASS fix...",
+        "cd %s && "
+        "sed -i 's/cuda_archs_loose_intersection(SCALED_MM_ARCHS \"10.0f;11.0f\"/cuda_archs_loose_intersection(SCALED_MM_ARCHS \"10.0f;11.0f;12.0f\"/' CMakeLists.txt && "
+        "sed -i 's/cuda_archs_loose_intersection(SCALED_MM_ARCHS \"10.0a\"/cuda_archs_loose_intersection(SCALED_MM_ARCHS \"10.0a;12.1a\"/' CMakeLists.txt" % vllm_dir,
+        timeout=10,
+    )
+
+    # 8c. Fix flashinfer-python license in uv cache
+    _dgx_run_step(
+        "  Patch: flashinfer-python license cache...",
+        "find $HOME/.cache/uv/sdists-v9/pypi/flashinfer-python -name 'pyproject.toml' "
+        "-exec sed -i 's/^license = \"Apache-2.0\"$/license = {text = \"Apache-2.0\"}/' {} \\; "
+        "-exec sed -i '/^license-files = /d' {} \\; 2>/dev/null; true",
+        timeout=10,
+    )
+
+    # 8d. Configure vLLM to use existing PyTorch
+    _dgx_run_step(
+        "  Patch: use_existing_torch.py...",
+        "%s && cd %s && "
+        "python use_existing_torch.py 2>/dev/null || true" % (activate, vllm_dir),
+        timeout=30,
+    )
+
+    log_queue.put("[INSTALL]   Patch applicate.\n")
+
+    # Step 9: Build vLLM (the big one, 15-20 min)
+    if not _dgx_run_step(
+        "Step 9/9: Build vLLM con TORCH_CUDA_ARCH_LIST=12.1a (15-20 min)...",
+        "export PATH=\"$HOME/.local/bin:$PATH\" && "
+        "%s && "
+        "cd %s && "
+        "export TORCH_CUDA_ARCH_LIST=12.1a && "
+        "export VLLM_USE_FLASHINFER_MXFP4_MOE=1 && "
+        "export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas && "
+        "uv pip install --no-build-isolation --prerelease=allow -e ." % (activate, vllm_dir),
+        timeout=2400,
+    ):
+        # Retry with flashinfer fix
+        log_queue.put("[INSTALL] Retry: fix flashinfer e rebuild...\n")
+        _dgx_run_step(
+            "  Fix flashinfer + retry build...",
+            "find $HOME/.cache/uv/sdists-v9/pypi/flashinfer-python -name 'pyproject.toml' "
+            "-exec sed -i 's/^license = \"Apache-2.0\"$/license = {text = \"Apache-2.0\"}/' {} \\; "
+            "-exec sed -i '/^license-files = /d' {} \\; 2>/dev/null; "
+            "export PATH=\"$HOME/.local/bin:$PATH\" && "
+            "%s && cd %s && "
+            "export TORCH_CUDA_ARCH_LIST=12.1a && "
+            "export VLLM_USE_FLASHINFER_MXFP4_MOE=1 && "
+            "export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas && "
+            "uv pip install --no-build-isolation --prerelease=allow -e ." % (activate, vllm_dir),
+            timeout=2400,
+        )
+
+    # Create env activation script
+    _dgx_run_step(
+        "Creazione script ambiente vllm_env.sh...",
+        "cat > %s/vllm_env.sh << 'ENVEOF'\n"
+        "#!/bin/bash\n"
+        "SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n"
+        "source \"$SCRIPT_DIR/.vllm/bin/activate\"\n"
+        "export TORCH_CUDA_ARCH_LIST=12.1a\n"
+        "export VLLM_USE_FLASHINFER_MXFP4_MOE=1\n"
+        "CUDA_PATH=$(ls -d /usr/local/cuda* 2>/dev/null | head -1)\n"
+        "export TRITON_PTXAS_PATH=\"$CUDA_PATH/bin/ptxas\"\n"
+        "export PATH=\"$CUDA_PATH/bin:$PATH\"\n"
+        "export LD_LIBRARY_PATH=\"$CUDA_PATH/lib64:$LD_LIBRARY_PATH\"\n"
+        "export TIKTOKEN_CACHE_DIR=\"$SCRIPT_DIR/.tiktoken_cache\"\n"
+        "mkdir -p \"$TIKTOKEN_CACHE_DIR\"\n"
+        "echo \"=== vLLM DGX Spark Environment Active ===\"\n"
+        "ENVEOF\n"
+        "chmod +x %s/vllm_env.sh" % (install_dir, install_dir),
+        timeout=10,
+    )
+
+    # Verification
+    log_queue.put("[INSTALL] Verifica installazione...\n")
+    rc, out, err = runner.run(
+        "%s && python -c \"import vllm; print('vLLM', vllm.__version__)\" && "
+        "python -c \"import torch; print('PyTorch', torch.__version__, 'CUDA', torch.version.cuda, 'GPU', torch.cuda.is_available())\"" % activate,
+        timeout=30,
+    )
+    if rc == 0:
+        for line in out.strip().splitlines():
+            log_queue.put("[INSTALL]   %s\n" % line)
+        log_queue.put("[INSTALL] === Installazione DGX Spark completata con successo! ===\n")
+    else:
+        log_queue.put("[ERROR] Verifica fallita: %s\n" % (err.strip() or out.strip()))
+
+    detector.detect()
 
 
 # --- API: GPU ---

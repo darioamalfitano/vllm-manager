@@ -1,6 +1,6 @@
-# vLLM Manager — Cross-Platform Desktop & Web App
+# vLLM Manager — Web App
 
-App desktop (Python + tkinter) e web (Python + Flask) per gestire server vLLM su qualsiasi piattaforma.
+App web (Python + Flask) per gestire server vLLM su qualsiasi piattaforma, accessibile da browser remoto.
 
 ## Piattaforme supportate
 
@@ -15,28 +15,51 @@ App desktop (Python + tkinter) e web (Python + Flask) per gestire server vLLM su
 
 ## Avvio
 
-### Desktop (tkinter)
-```bash
-python vllm_manager.py
-```
-
-### Web (accesso remoto via browser)
 ```bash
 pip install flask
 python vllm_manager_web.py --host 0.0.0.0 --port 5000
 ```
-Poi apri `http://<ip-server>:5000` nel browser. Ideale per macchine remote accessibili solo via SSH.
 
-La piattaforma viene rilevata automaticamente all'avvio.
+Poi apri `http://<ip-server>:5000` nel browser.
 
-## Compilare standalone
+La piattaforma viene rilevata automaticamente all'avvio. Se vLLM non e' installato, il pulsante **Installa vLLM** nel tab Server esegue l'installazione completa per la piattaforma rilevata.
 
-| Piattaforma | Script | Output |
-|---|---|---|
-| Windows | `build_exe.bat` | `dist\vLLM Manager.exe` |
-| Linux | `./build_linux.sh` | `dist/vllm-manager` (+ AppImage opzionale) |
-| macOS | `./build_macos.sh` | `dist/vLLM Manager.app` |
-| DGX Spark | `./build_dgx.sh` | `dist/vllm-manager-dgx` |
+---
+
+## Installazione automatica vLLM
+
+Il manager gestisce autonomamente l'installazione di vLLM in base alla piattaforma:
+
+### Linux / Windows WSL2
+- Crea virtualenv `~/vllm-env`
+- Installa vLLM via `pip install vllm`
+
+### macOS Apple Silicon
+- Crea virtualenv `~/vllm-env`
+- Installa `vllm-mlx` via pip
+
+### DGX Spark (Blackwell GB10 / sm_121)
+
+Installazione completa in 9 step (~20-30 minuti), basata su [dgx-spark-vllm-setup](https://github.com/eelbaz/dgx-spark-vllm-setup):
+
+1. Controlli pre-installazione (GPU, CUDA, spazio disco)
+2. Installazione `uv` package manager
+3. Creazione virtualenv Python 3.12 in `~/vllm-install/.vllm`
+4. PyTorch 2.9.0+cu130 (CUDA 13.0 per Blackwell)
+5. Triton da source (branch main, supporto sm_121a)
+6. Dipendenze (xgrammar, setuptools-scm, apache-tvm-ffi)
+7. Clone vLLM (commit testato)
+8. Patch critiche:
+   - `pyproject.toml` license field
+   - `CMakeLists.txt` — aggiunta SM100/SM120/SM121 ai kernel CUTLASS
+   - flashinfer-python license fix
+   - `use_existing_torch.py`
+9. Build vLLM con `TORCH_CUDA_ARCH_LIST=12.1a`
+
+Variabili ambiente settate automaticamente all'avvio server:
+- `TORCH_CUDA_ARCH_LIST=12.1a`
+- `VLLM_USE_FLASHINFER_MXFP4_MOE=1`
+- `TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas`
 
 ---
 
@@ -44,39 +67,37 @@ La piattaforma viene rilevata automaticamente all'avvio.
 
 | Tab | Cosa fa |
 |-----|---------|
-| **Server** | Start/Stop server vLLM, scelta modello (preset per piattaforma + custom HF), parametri (gpu-memory-utilization, max-model-len, dtype, prefix-caching, chat template, attention backend, extra args), salvataggio profili rapido |
+| **Server** | Start/Stop server vLLM, scelta modello (preset per piattaforma + custom HF), parametri (gpu-memory-utilization, max-model-len, dtype, prefix-caching, chat template, attention backend, extra args), salvataggio profili, installazione vLLM |
 | **GPU Monitor** | VRAM/Memoria, utilizzo GPU, temperatura, potenza in tempo reale con grafico storico 2 minuti |
-| **Logs** | Log server in tempo reale, colorazione errori/warning, ricerca (Ctrl+F / Cmd+F) |
+| **Logs** | Log server in tempo reale (SSE), colorazione errori/warning, ricerca |
 | **Models** | Ricerca modelli su HuggingFace, lista modelli scaricati localmente con dimensioni, eliminazione per liberare spazio |
 | **Benchmark** | Test performance con prompt preset o custom, misura tokens/sec e TTFT (Time to First Token) |
-| **WebUI** | Start/Stop container Open WebUI (Docker), apri browser, log Docker |
-| **Profili** | Salva/carica/elimina configurazioni server, esporta/importa JSON |
-| **DGX Spark** | *(solo su DGX)* Cluster overview, node discovery, Ray cluster, multi-node inference, installazione vLLM, SSH config |
+| **WebUI** | Start/Stop container Open WebUI (Docker) |
+| **Profili** | Salva/carica/elimina configurazioni server |
+| **DGX Spark** | *(solo su DGX)* Cluster overview, node discovery, variabili NCCL, Ray cluster, multi-node inference, SSH config |
 
 ---
 
 ## Differenze per piattaforma
 
-### macOS Apple Silicon
-- GPU Memory Utilization nascosto (non applicabile)
-- "VRAM" rinominato in "Memoria" (memoria unificata)
-- Scelta backend MLX: auto / vllm-metal / vllm-mlx
-- Preset modelli MLX quantizzati (mlx-community)
-- Temperatura e potenza GPU: N/A
-
 ### DGX Spark
-- Tab 8 dedicato con gestione completa cluster
+- Tab dedicato con gestione completa cluster
 - Preset modelli da 70B+ (128 GB per nodo)
 - Attention backend configurabile (TRITON_ATTN / FLASHINFER / XFORMERS)
 - Variabili ambiente NCCL/UCX/GLOO editabili
-- Ray cluster: avvio head, connessione workers, dashboard
+- Ray cluster: avvio head, connessione workers
 - Multi-node inference con tensor-parallel e pipeline-parallel
-- Installazione vLLM da source (build sm_121) o via Docker NVIDIA
+- Installazione automatica vLLM con patch Blackwell sm_121
 - Gestione SSH per nodi remoti
+
+### macOS Apple Silicon
+- GPU Memory Utilization nascosto (non applicabile)
+- "VRAM" rinominato in "Memoria" (memoria unificata)
+- Preset modelli MLX quantizzati (mlx-community)
+- Temperatura e potenza GPU: N/A
 
 ### Windows WSL2
 - Comandi eseguiti via `wsl -d Ubuntu-22.04 -- bash`
-- "Stoppa Tutto" termina anche WSL
 - Docker via `docker.exe` (Docker Desktop)
 
 ### Linux nativo
@@ -89,8 +110,7 @@ La piattaforma viene rilevata automaticamente all'avvio.
 
 ### Avviare il server
 ```bash
-# Attiva il virtualenv (se presente)
-source ~/vllm-env/bin/activate
+source ~/vllm-env/bin/activate  # o ~/vllm-install/vllm_env.sh su DGX
 
 vllm serve Qwen/Qwen2.5-7B-Instruct \
   --host 0.0.0.0 \
@@ -100,8 +120,6 @@ vllm serve Qwen/Qwen2.5-7B-Instruct \
   --dtype auto \
   --enable-prefix-caching
 ```
-
-Server accessibile su `http://localhost:8000`
 
 ### Modelli consigliati
 
@@ -113,14 +131,12 @@ Server accessibile su `http://localhost:8000`
 | Qwen/Qwen2.5-7B-Instruct | ~14 GB | Buon bilanciamento |
 | meta-llama/Llama-3.1-8B-Instruct | ~16 GB | Al limite, ridurre max-model-len |
 | TheBloke/Mistral-7B-Instruct-v0.2-AWQ | ~4 GB | Quantizzato AWQ, veloce |
-| TheBloke/Llama-2-13B-GPTQ | ~8 GB | 13B quantizzato |
 
 #### macOS Apple Silicon
 
 | Modello | Memoria | Note |
 |---------|---------|------|
 | Qwen/Qwen2.5-1.5B-Instruct | ~3 GB | Test veloce |
-| meta-llama/Llama-3.2-3B-Instruct | ~6 GB | Compatto |
 | mlx-community/Qwen2.5-7B-Instruct-4bit | ~4 GB | MLX quantizzato |
 
 #### DGX Spark (128 GB per nodo)
@@ -144,20 +160,6 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-### Test via Python
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
-response = client.chat.completions.create(
-    model="Qwen/Qwen2.5-7B-Instruct",
-    messages=[{"role": "user", "content": "Ciao!"}],
-    temperature=0.7,
-    max_tokens=200,
-)
-print(response.choices[0].message.content)
-```
-
 ### Open WebUI (Docker)
 ```bash
 docker run -d -p 3000:8080 \
@@ -168,7 +170,6 @@ docker run -d -p 3000:8080 \
   --restart always \
   ghcr.io/open-webui/open-webui:main
 ```
-Poi apri `http://localhost:3000`
 
 ---
 
@@ -184,18 +185,10 @@ Poi apri `http://localhost:3000`
 
 ## Architettura tecnica
 
-### Desktop (`vllm_manager.py`)
-- **Single file**: Python + tkinter, solo stdlib
-- **Threading**: operazioni lunghe in thread daemon, comunicazione thread->UI via `queue.Queue` + `root.after()`
-- **Polling**: GPU ogni 2s, log ogni 250ms, status server ogni 5s
-
-### Web (`vllm_manager_web.py`)
-- **Single file**: Python + Flask (unica dipendenza esterna)
-- **REST API**: tutti i controlli esposti come endpoint JSON (`/api/server/*`, `/api/gpu`, `/api/models/*`, etc.)
-- **SSE (Server-Sent Events)**: log in tempo reale senza polling via `/api/logs/stream`
+- **Single file**: `vllm_manager_web.py` (Python + Flask)
+- **REST API**: tutti i controlli esposti come endpoint JSON (`/api/server/*`, `/api/gpu`, `/api/models/*`, `/api/dgx/*`, etc.)
+- **SSE (Server-Sent Events)**: log in tempo reale via `/api/logs/stream`
 - **Frontend**: HTML/CSS/JS embedded, dark theme, responsive
-
-### Comune
 - **Cross-platform**: PlatformInfo (auto-detect), CommandRunner (WSL/Native/DGX), GpuMonitor (Nvidia/AppleSilicon), VLLMDetector (auto-find backend)
 - **Backend**: VLLMProcess (ciclo vita server), VLLMApi (client HTTP urllib), ConfigManager (profili JSON)
 
