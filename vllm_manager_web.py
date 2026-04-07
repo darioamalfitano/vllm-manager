@@ -465,6 +465,19 @@ class VLLMDetector:
         return "source %s/bin/activate && " % self.venv_path if self.venv_path else ""
 
     @property
+    def install_dir(self) -> str:
+        """Return the parent install directory (containing the venv).
+        For DGX: ~/vllm-install  (venv is ~/vllm-install/.vllm)
+        For others: ~/vllm-env   (venv IS the install dir)
+        """
+        if self.venv_path:
+            # DGX pattern: ~/vllm-install/.vllm -> return ~/vllm-install
+            if self.venv_path.endswith("/.vllm"):
+                return self.venv_path[:-6]
+            return self.venv_path
+        return ""
+
+    @property
     def server_module(self) -> str:
         if self.backend == "mlx-metal":
             return "vllm_metal.server"
@@ -537,8 +550,8 @@ DGX_WIZARD_PARAMS_SCHEMA = [
                 "tooltip": "ID del modello HuggingFace o percorso locale al modello. "
                            "Esempio: meta-llama/Llama-3.3-70B-Instruct. "
                            "Recuperabile da https://huggingface.co/models filtrando per 'text-generation'.",
-                "dgx_tip": "Su DGX Spark (128 GB VRAM unificata) si possono caricare modelli fino a ~70B in full precision "
-                           "o ~140B con quantizzazione NVFP4. Per multi-nodo (2 Spark) fino a ~140B full o 405B quantizzato.",
+                "dgx_tip": "Su DGX Spark (128 GB memoria unificata LPDDR5x CPU+GPU) si possono caricare modelli fino a ~70B in full precision "
+                           "o ~140B con quantizzazione FP4. Per multi-nodo (2 Spark) fino a ~140B full o 405B quantizzato.",
                 "required": True,
             },
             {
@@ -585,14 +598,15 @@ DGX_WIZARD_PARAMS_SCHEMA = [
             },
             {
                 "key": "quantization", "type": "select", "default": "",
-                "options": ["", "awq", "gptq", "squeezellm", "fp8", "nvfp4", "marlin", "bitsandbytes"],
+                "options": ["", "awq", "gptq", "fp8", "compressed-tensors", "modelopt_fp4", "marlin", "bitsandbytes", "aqlm", "squeezellm"],
                 "label": "Quantizzazione",
                 "tooltip": "Metodo di quantizzazione dei pesi. Riduce VRAM a scapito di qualita'. "
                            "AWQ/GPTQ: quantizzazione 4-bit pre-calcolata (il modello deve essere gia' quantizzato). "
-                           "FP8: 8-bit floating point. NVFP4: NVIDIA FP4 nativo. "
+                           "FP8: 8-bit floating point. modelopt_fp4: NVIDIA FP4 nativo via ModelOpt (richiede checkpoint FP4). "
+                           "compressed-tensors: formato generico per modelli compressi. "
                            "Se vuoto, nessuna quantizzazione (pesi originali).",
-                "dgx_tip": "NVFP4 e' supportato nativamente su Blackwell (sm_121) ed offre il miglior rapporto qualita'/compressione. "
-                           "FP8 e' un buon compromesso. Per modelli >70B su singolo Spark, considerare fp8 o nvfp4.",
+                "dgx_tip": "modelopt_fp4 e' supportato nativamente su Blackwell (sm_121) ed offre il miglior rapporto qualita'/compressione. "
+                           "FP8 e' un buon compromesso. Per modelli >70B su singolo Spark, considerare fp8 o modelopt_fp4.",
             },
             {
                 "key": "enforce_eager", "type": "checkbox", "default": False,
@@ -654,12 +668,12 @@ DGX_WIZARD_PARAMS_SCHEMA = [
                 "dgx_tip": "16 e' il default ottimale per la maggior parte dei casi su DGX Spark.",
             },
             {
-                "key": "enable_prefix_caching", "type": "checkbox", "default": True,
+                "key": "enable_prefix_caching", "type": "checkbox", "default": False,
                 "label": "Prefix Caching",
                 "tooltip": "Riutilizza la KV cache per prefissi di prompt identici tra richieste diverse. "
                            "Migliora significativamente il throughput quando piu' richieste condividono lo stesso system prompt "
-                           "o contesto iniziale.",
-                "dgx_tip": "Consigliato attivo. Particolarmente utile con system prompt lunghi o RAG.",
+                           "o contesto iniziale. In vLLM il default e' disattivato (auto-detect).",
+                "dgx_tip": "Consigliato attivo per ambienti con system prompt condivisi. Particolarmente utile con RAG.",
             },
             {
                 "key": "calculate_kv_scales", "type": "checkbox", "default": False,
@@ -706,14 +720,14 @@ DGX_WIZARD_PARAMS_SCHEMA = [
                 "advanced": True,
             },
             {
-                "key": "distributed_executor_backend", "type": "select", "default": "auto",
-                "options": ["auto", "ray", "mp"],
+                "key": "distributed_executor_backend", "type": "select", "default": "",
+                "options": ["", "ray", "mp"],
                 "label": "Backend Esecuzione Distribuita",
-                "tooltip": "Backend per l'esecuzione distribuita. 'auto' sceglie automaticamente. "
+                "tooltip": "Backend per l'esecuzione distribuita. Vuoto = automatico (vLLM sceglie in base alla configurazione). "
                            "'ray': usa Ray per orchestrazione multi-nodo (richiede Ray installato e cluster attivo). "
                            "'mp': usa multiprocessing Python (solo singolo nodo, piu' GPU).",
                 "dgx_tip": "Per multi-nodo DGX Spark: usare 'ray' (richiede cluster Ray configurato nel tab DGX Spark). "
-                           "Per singolo nodo: 'auto' o 'mp'.",
+                           "Per singolo nodo: lasciare vuoto o 'mp'.",
             },
             {
                 "key": "enable_expert_parallel", "type": "checkbox", "default": False,
@@ -767,13 +781,14 @@ DGX_WIZARD_PARAMS_SCHEMA = [
                 "dgx_tip": "8000 e' il default standard. Cambiare se si avviano piu' istanze vLLM sullo stesso nodo.",
             },
             {
-                "key": "max_num_seqs", "type": "number", "default": 256,
+                "key": "max_num_seqs", "type": "number", "default": 0,
                 "label": "Max Sequenze in Batch",
                 "tooltip": "Numero massimo di sequenze elaborate contemporaneamente in un batch. "
+                           "0 = automatico (vLLM decide in base al modello e alla memoria disponibile). "
                            "Valori alti = piu' throughput ma piu' latenza per singola richiesta. "
                            "Valori bassi = meno throughput ma latenza piu' bassa.",
                 "dgx_tip": "Per modelli grandi (70B): ridurre a 32-64. Per modelli piccoli (7B): 128-256. "
-                           "Bilanciare in base al carico previsto.",
+                           "Lasciare 0 per calcolo automatico.",
             },
             {
                 "key": "max_num_batched_tokens", "type": "number", "default": 0,
@@ -794,11 +809,11 @@ DGX_WIZARD_PARAMS_SCHEMA = [
                            "Leggero overhead sul throughput totale.",
             },
             {
-                "key": "chat_template", "type": "select", "default": "",
-                "options": ["", "llama-2", "mistral", "chatml"],
+                "key": "chat_template", "type": "text", "default": "",
                 "label": "Template Chat",
-                "tooltip": "Template per formattare i messaggi di chat. Vuoto = auto-detect dal tokenizer del modello. "
-                           "llama-2: formato [INST][/INST]. mistral: formato Mistral. chatml: formato <|im_start|>. "
+                "tooltip": "Percorso a un file template Jinja2 per formattare i messaggi di chat, oppure il nome "
+                           "di un template registrato nel tokenizer. Vuoto = auto-detect dal tokenizer del modello. "
+                           "vLLM accetta: percorso file .jinja, stringa template inline, o nome template dal tokenizer. "
                            "La maggior parte dei modelli moderni include il template nel tokenizer.",
                 "dgx_tip": "Lasciare vuoto (auto) per la maggior parte dei modelli recenti. "
                            "Specificare solo se il modello non include un template o se si vuole forzarne uno diverso.",
@@ -821,22 +836,23 @@ DGX_WIZARD_PARAMS_SCHEMA = [
         "params": [
             {
                 "key": "attention_backend", "type": "select", "default": "",
-                "options": ["", "TRITON_ATTN", "FLASHINFER", "XFORMERS"],
+                "options": ["", "FLASH_ATTN", "FLASHINFER", "TORCH_SDPA", "XFORMERS"],
                 "label": "Backend Attention",
                 "tooltip": "Implementazione del meccanismo di attenzione. Vuoto = auto-select. "
-                           "TRITON_ATTN: implementazione Triton, compatibile con piu' architetture. "
-                           "FLASHINFER: ottimizzato per throughput, richiede libreria flashinfer. "
-                           "XFORMERS: libreria xFormers di Meta.",
-                "dgx_tip": "Su DGX Spark (Blackwell sm_121): TRITON_ATTN e' il piu' compatibile e testato. "
-                           "FLASHINFER puo' offrire performance migliori ma potrebbe richiedere build custom. "
-                           "Impostato via variabile d'ambiente VLLM_ATTENTION_BACKEND.",
+                           "FLASH_ATTN: Flash Attention 2/3. FLASHINFER: ottimizzato per throughput. "
+                           "TORCH_SDPA: PyTorch scaled dot-product attention. XFORMERS: libreria xFormers di Meta. "
+                           "Configurato via env var VLLM_ATTENTION_BACKEND o --attention-config.",
+                "dgx_tip": "Su DGX Spark (Blackwell sm_121): FLASH_ATTN o FLASHINFER sono consigliati. "
+                           "Se non funzionano, provare TORCH_SDPA come fallback. "
+                           "Nota: impostato via variabile d'ambiente VLLM_ATTENTION_BACKEND, non come flag CLI diretto.",
             },
             {
-                "key": "disable_cascade_attn", "type": "checkbox", "default": False,
+                "key": "disable_cascade_attn", "type": "checkbox", "default": True,
                 "label": "Disabilita Cascade Attention",
                 "tooltip": "Disabilita l'ottimizzazione cascade attention che separa il computo tra prefix cache "
-                           "e token nuovi. Utile se causa instabilita' o risultati incorretti.",
-                "dgx_tip": "Lasciare disattivato (cascade attivo). Attivare solo se si verificano problemi.",
+                           "e token nuovi. In vLLM il default e' disabilitato (True). "
+                           "Abilitare cascade attention puo' migliorare le performance con prefix caching attivo.",
+                "dgx_tip": "Il default vLLM e' disabilitato. Provare a disattivare (cascade attivo) se si usa prefix caching.",
                 "advanced": True,
             },
             {
@@ -891,7 +907,8 @@ DGX_WIZARD_PARAMS_SCHEMA = [
                 "label": "Modello Draft",
                 "tooltip": "ID HuggingFace del modello 'draft' per speculative decoding. "
                            "Deve essere un modello piu' piccolo e veloce dello stesso tipo (es. 1B per un modello 70B). "
-                           "Se vuoto, speculative decoding e' disabilitato.",
+                           "Se vuoto, speculative decoding e' disabilitato. "
+                           "Passato a vLLM via --speculative-config JSON (i flag separati sono deprecati).",
                 "dgx_tip": "Esempio: per Llama-3.3-70B usare meta-llama/Llama-3.2-1B-Instruct come draft. "
                            "Puo' aumentare il throughput del 30-50% per generazione lunga.",
                 "advanced": True,
@@ -902,7 +919,8 @@ DGX_WIZARD_PARAMS_SCHEMA = [
                 "label": "Token Speculativi",
                 "tooltip": "Numero di token generati speculativamente dal modello draft per ogni iterazione. "
                            "0 = disabilitato. Valori tipici: 3-5. "
-                           "Piu' alto = piu' speedup potenziale ma piu' token da verificare.",
+                           "Piu' alto = piu' speedup potenziale ma piu' token da verificare. "
+                           "Passato a vLLM via --speculative-config JSON.",
                 "dgx_tip": "3-5 e' un buon compromesso. Valori troppo alti riducono il tasso di accettazione.",
                 "advanced": True,
             },
@@ -915,17 +933,9 @@ DGX_WIZARD_PARAMS_SCHEMA = [
                 "key": "disable_log_stats", "type": "checkbox", "default": False,
                 "label": "Disabilita Statistiche Log",
                 "tooltip": "Disabilita la stampa di statistiche periodiche nei log (throughput, latenza, code). "
-                           "Riduce il volume dei log in produzione.",
+                           "Riduce il volume dei log in produzione. Flag CLI: --disable-log-stats.",
                 "dgx_tip": "Lasciare disattivato durante il setup per monitorare le performance. "
                            "Attivare in produzione se i log sono troppo verbosi.",
-                "advanced": True,
-            },
-            {
-                "key": "enable_metrics", "type": "checkbox", "default": True,
-                "label": "Abilita Metriche KV Cache",
-                "tooltip": "Abilita le metriche dettagliate sulla KV cache (occupazione, hit rate del prefix caching). "
-                           "Utile per monitoraggio ma aggiunge un leggero overhead.",
-                "dgx_tip": "Consigliato attivo durante il tuning iniziale. Disattivare per massime performance.",
                 "advanced": True,
             },
         ],
@@ -1061,7 +1071,7 @@ class VLLMProcess:
               speculative_model=None, num_speculative_tokens=None,
               distributed_executor_backend=None, nnodes=1,
               scheduling_policy=None, disable_log_stats=False,
-              disable_cascade_attn=False, disable_sliding_window=False,
+              disable_cascade_attn=True, disable_sliding_window=False,
               enable_expert_parallel=False):
         if self.running:
             return
@@ -1124,10 +1134,12 @@ class VLLMProcess:
                 if max_lora_rank and max_lora_rank != 16:
                     parts.append("--max-lora-rank %d" % max_lora_rank)
             if speculative_model:
-                parts.append("--speculative-model '%s'" % speculative_model)
+                import json as _json
+                spec_cfg = {"model": speculative_model, "method": "draft_model"}
                 if num_speculative_tokens and num_speculative_tokens > 0:
-                    parts.append("--num-speculative-tokens %d" % num_speculative_tokens)
-            if distributed_executor_backend and distributed_executor_backend != "auto":
+                    spec_cfg["num_speculative_tokens"] = num_speculative_tokens
+                parts.append("--speculative-config '%s'" % _json.dumps(spec_cfg))
+            if distributed_executor_backend and distributed_executor_backend not in ("", "auto"):
                 parts.append("--distributed-executor-backend %s" % distributed_executor_backend)
             if nnodes and nnodes > 1:
                 parts.append("--nnodes %d" % nnodes)
@@ -1414,9 +1426,11 @@ def api_server_status():
 
 @app.route("/api/server/install", methods=["POST"])
 def api_install_vllm():
+    data = flask_request.json or {}
+    force = data.get("force", False)
     def _install():
         if platform_info.is_dgx:
-            _install_vllm_dgx()
+            _install_vllm_dgx(force=force)
         elif platform_info.os == "macos":
             _install_vllm_simple([
                 ("Creazione virtualenv...",
@@ -1477,14 +1491,30 @@ def _dgx_run_step(msg, cmd, timeout=1800):
     return True
 
 
-def _install_vllm_dgx(vllm_commit=None, triton_commit=None, pytorch_index=None, install_dir=None):
-    """Full DGX Spark installation: uv, PyTorch, Triton, patched vLLM."""
+def _install_vllm_dgx(vllm_commit=None, triton_commit=None, pytorch_index=None, install_dir=None, force=False):
+    """Full DGX Spark installation: uv, PyTorch, Triton, patched vLLM.
+    If force=False and a working installation is found, skip."""
     vllm_commit = vllm_commit or DGX_VLLM_COMMIT
     triton_commit = triton_commit or DGX_TRITON_COMMIT
     pytorch_index = pytorch_index or DGX_PYTORCH_INDEX
     install_dir = install_dir or DGX_INSTALL_DIR_DEFAULT
     venv_dir = install_dir + "/.vllm"
     activate = "source %s/bin/activate" % venv_dir
+
+    # Check for existing working installation
+    if not force:
+        rc, out, _ = runner.run(
+            "test -f %s/bin/activate && %s && "
+            "python -c \"import vllm; print(vllm.__version__)\" && "
+            "python -c \"import torch; print(torch.cuda.is_available())\"" % (venv_dir, activate),
+            timeout=20)
+        if rc == 0 and "True" in out:
+            lines = out.strip().split("\n")
+            vllm_ver = lines[0].strip() if lines else "?"
+            log_queue.put("[INSTALL] Installazione esistente trovata: vLLM %s con PyTorch CUDA.\n" % vllm_ver)
+            log_queue.put("[INSTALL] Saltata installazione. Usa 'Forza Reinstallazione' per reinstallare.\n")
+            detector.detect()
+            return
 
     log_queue.put("[INSTALL] === Installazione vLLM per DGX Spark (Blackwell GB10) ===\n")
     log_queue.put("[INSTALL] Directory: %s\n" % install_dir)
@@ -1612,9 +1642,18 @@ def _install_vllm_dgx(vllm_commit=None, triton_commit=None, pytorch_index=None, 
     _dgx_run_step(
         "  Patch: use_existing_torch.py...",
         "%s && cd %s && "
-        "python use_existing_torch.py 2>/dev/null || true" % (activate, vllm_dir),
+        "python use_existing_torch.py" % (activate, vllm_dir),
         timeout=30,
     )
+
+    # 8e. Record PyTorch version before build to detect overwrites
+    rc_pt, out_pt, _ = runner.run(
+        "%s && python -c \"import torch; print(torch.__version__)\"" % activate, timeout=10)
+    torch_ver_before = out_pt.strip() if rc_pt == 0 else ""
+    if torch_ver_before:
+        log_queue.put("[INSTALL]   PyTorch pre-build: %s\n" % torch_ver_before)
+    else:
+        log_queue.put("[WARNING]   PyTorch NON trovato prima del build! Reinstallazione forzata dopo il build.\n")
 
     log_queue.put("[INSTALL]   Patch applicate.\n")
 
@@ -1645,6 +1684,26 @@ def _install_vllm_dgx(vllm_commit=None, triton_commit=None, pytorch_index=None, 
             "uv pip install --no-build-isolation --prerelease=allow -e ." % (activate, vllm_dir),
             timeout=2400,
         )
+
+    # Step 9b: Verify PyTorch is still the CUDA version (uv may have overwritten it)
+    rc_pt2, out_pt2, _ = runner.run(
+        "%s && python -c \"import torch; print(torch.__version__); print(torch.cuda.is_available())\"" % activate,
+        timeout=15)
+    torch_ok = rc_pt2 == 0 and "True" in out_pt2
+    if not torch_ok:
+        log_queue.put("[WARNING] PyTorch CUDA non trovato dopo il build! Reinstallazione PyTorch cu130...\n")
+        _dgx_run_step(
+            "  Reinstallazione PyTorch 2.9.0+cu130 (sovrascritto durante il build)...",
+            "export PATH=\"$HOME/.local/bin:$PATH\" && "
+            "%s && "
+            "uv pip install torch torchvision torchaudio --index-url %s --force-reinstall && "
+            "python -c \"import torch; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda)\"" % (
+                activate, pytorch_index),
+            timeout=600,
+        )
+    else:
+        torch_ver_after = out_pt2.strip().split("\n")[0] if out_pt2.strip() else ""
+        log_queue.put("[INSTALL]   PyTorch post-build: %s (CUDA OK)\n" % torch_ver_after)
 
     # Create env activation script
     _dgx_run_step(
@@ -2144,6 +2203,9 @@ def _dgx_remote_run_step(msg, cmd, ip, user, timeout=1800):
 def _install_vllm_dgx_remote(ip, user):
     """Full DGX Spark installation on a remote worker node via SSH."""
     install_dir = DGX_INSTALL_DIR_DEFAULT
+    vllm_commit = DGX_VLLM_COMMIT
+    triton_commit = DGX_TRITON_COMMIT
+    pytorch_index = DGX_PYTORCH_INDEX
     venv_dir = install_dir + "/.vllm"
     activate = "source %s/bin/activate" % venv_dir
 
@@ -2266,9 +2328,18 @@ def _install_vllm_dgx_remote(ip, user):
     _dgx_remote_run_step(
         "  Patch: use_existing_torch.py...",
         "%s && cd %s && "
-        "python use_existing_torch.py 2>/dev/null || true" % (activate, vllm_dir),
+        "python use_existing_torch.py" % (activate, vllm_dir),
         ip, user, timeout=30,
     )
+
+    # Record PyTorch version before build
+    rc_pt, out_pt, _ = _ssh_cmd_b64(user, ip,
+        "%s && python -c \"import torch; print(torch.__version__)\"" % activate, timeout=10)
+    torch_ver_before = out_pt.strip() if rc_pt == 0 else ""
+    if torch_ver_before:
+        log_queue.put("[WORKER %s]   PyTorch pre-build: %s\n" % (ip, torch_ver_before))
+    else:
+        log_queue.put("[WORKER %s WARNING]   PyTorch NON trovato prima del build!\n" % ip)
 
     # Step 9: Build vLLM
     if not _dgx_remote_run_step(
@@ -2298,6 +2369,23 @@ def _install_vllm_dgx_remote(ip, user):
             ip, user, timeout=2400,
         ):
             return False
+
+    # Verify PyTorch is still the CUDA version after build
+    rc_pt2, out_pt2, _ = _ssh_cmd_b64(user, ip,
+        "%s && python -c \"import torch; print(torch.__version__); print(torch.cuda.is_available())\"" % activate,
+        timeout=15)
+    torch_ok = rc_pt2 == 0 and "True" in out_pt2
+    if not torch_ok:
+        log_queue.put("[WORKER %s WARNING] PyTorch CUDA sovrascritto! Reinstallazione...\n" % ip)
+        _dgx_remote_run_step(
+            "  Reinstallazione PyTorch cu130...",
+            "export PATH=\"$HOME/.local/bin:$PATH\" && "
+            "%s && "
+            "uv pip install torch torchvision torchaudio --index-url %s --force-reinstall && "
+            "python -c \"import torch; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda)\"" % (
+                activate, pytorch_index),
+            ip, user, timeout=600,
+        )
 
     # Create env activation script
     _dgx_remote_run_step(
@@ -2338,7 +2426,8 @@ def _install_vllm_dgx_remote(ip, user):
 
 def _verify_worker(ip, user):
     """Check GPU, vLLM, and Ray on a remote worker. Returns dict of results."""
-    activate = "source %s/.vllm/bin/activate" % DGX_INSTALL_DIR_DEFAULT
+    dgx_dir = detector.install_dir or DGX_INSTALL_DIR_DEFAULT
+    activate = "source %s/.vllm/bin/activate" % dgx_dir
     results = {}
 
     # GPU check
@@ -2526,7 +2615,8 @@ def api_dgx_ray_start_cluster():
                 log_queue.put("[RAY] Skip worker %s (stato: %s)\n" % (ip, w.get("status", "?")))
                 continue
             log_queue.put("[RAY] Connessione worker %s...\n" % ip)
-            activate = "source %s/.vllm/bin/activate" % DGX_INSTALL_DIR_DEFAULT
+            dgx_dir = detector.install_dir or DGX_INSTALL_DIR_DEFAULT
+            activate = "source %s/.vllm/bin/activate" % dgx_dir
             rc, out, err = _ssh_cmd_b64(w["user"], ip,
                 "%s && ray start --address=%s:6379" % (activate, head_ip), timeout=30)
             if rc == 0:
@@ -2551,7 +2641,8 @@ def api_dgx_ray_stop_cluster():
         for ip, w in workers.items():
             if w.get("status") == "ray_connected":
                 log_queue.put("[RAY] Stop worker %s...\n" % ip)
-                activate = "source %s/.vllm/bin/activate" % DGX_INSTALL_DIR_DEFAULT
+                dgx_dir = detector.install_dir or DGX_INSTALL_DIR_DEFAULT
+                activate = "source %s/.vllm/bin/activate" % dgx_dir
                 _ssh_cmd_b64(w["user"], ip, "%s && ray stop" % activate, timeout=15)
                 config.update_worker_status(ip, "ready")
         # Stop head
@@ -2658,19 +2749,22 @@ def api_dgx_wizard_hw_detect():
     else:
         results["nccl"] = {"ok": False, "info": "NCCL non disponibile o torch non installato"}
 
-    # Existing installation
+    # Existing installation — use detector's path if available, fallback to default
+    detected_dir = detector.install_dir or DGX_INSTALL_DIR_DEFAULT
     rc, out, _ = runner.run(
-        "test -d %s && echo 'exists' || echo 'not_found'" % DGX_INSTALL_DIR_DEFAULT, timeout=5)
+        "test -d %s && echo 'exists' || echo 'not_found'" % detected_dir, timeout=5)
     has_install = "exists" in out
-    vllm_ver = ""
-    if has_install:
+    vllm_ver = detector.version or ""
+    if has_install and not vllm_ver:
         rc2, out2, _ = runner.run(
             "source %s/.vllm/bin/activate 2>/dev/null && python -c \"import vllm; print(vllm.__version__)\" 2>/dev/null"
-            % DGX_INSTALL_DIR_DEFAULT, timeout=10)
+            % detected_dir, timeout=10)
         if rc2 == 0:
             vllm_ver = out2.strip()
-    results["existing_install"] = {"found": has_install, "vllm_version": vllm_ver,
-                                    "path": DGX_INSTALL_DIR_DEFAULT}
+    results["existing_install"] = {"found": has_install or detector.is_installed,
+                                    "vllm_version": vllm_ver,
+                                    "path": detected_dir,
+                                    "venv_path": detector.venv_path or ""}
 
     return jsonify(results)
 
@@ -2700,6 +2794,7 @@ def api_dgx_wizard_install_start():
 
     wiz = config.get_wizard()
     ic = wiz.get("install_config", {})
+    force = request.json.get("force", False) if request.json else False
 
     def _run_install():
         global _wizard_install_state
@@ -2710,6 +2805,7 @@ def api_dgx_wizard_install_start():
                 triton_commit=ic.get("triton_commit") or None,
                 pytorch_index=ic.get("pytorch_index") or None,
                 install_dir=ic.get("install_dir") or None,
+                force=force,
             )
             _wizard_install_state["status"] = "done"
             config.save_wizard_step("install_status", "done")
@@ -2725,6 +2821,30 @@ def api_dgx_wizard_install_start():
 @app.route("/api/dgx/wizard/install-status")
 def api_dgx_wizard_install_status():
     return jsonify(_wizard_install_state)
+
+
+@app.route("/api/dgx/wizard/install-check")
+def api_dgx_wizard_install_check():
+    """Quick check if vLLM+PyTorch are installed and working."""
+    dgx_dir = detector.install_dir or DGX_INSTALL_DIR_DEFAULT
+    venv = dgx_dir + "/.vllm"
+    activate = "source %s/bin/activate" % venv
+    rc, out, _ = runner.run(
+        "test -f %s/bin/activate && %s && "
+        "python -c \"import vllm; print(vllm.__version__)\" && "
+        "python -c \"import torch; print(torch.__version__); print(torch.cuda.is_available())\"" % (venv, activate),
+        timeout=20)
+    if rc == 0:
+        lines = out.strip().split("\n")
+        vllm_ver = lines[0].strip() if len(lines) > 0 else ""
+        torch_ver = lines[1].strip() if len(lines) > 1 else ""
+        cuda_ok = "True" in (lines[2] if len(lines) > 2 else "")
+        return jsonify({
+            "installed": True, "vllm_version": vllm_ver,
+            "torch_version": torch_ver, "cuda_available": cuda_ok,
+            "path": dgx_dir,
+        })
+    return jsonify({"installed": False, "path": dgx_dir})
 
 
 @app.route("/api/dgx/wizard/model-save", methods=["POST"])
@@ -2903,7 +3023,7 @@ def api_dgx_wizard_launch():
             nnodes=int(params.get("nnodes", 1)),
             scheduling_policy=params.get("scheduling_policy"),
             disable_log_stats=params.get("disable_log_stats", False),
-            disable_cascade_attn=params.get("disable_cascade_attn", False),
+            disable_cascade_attn=params.get("disable_cascade_attn", True),
             disable_sliding_window=params.get("disable_sliding_window", False),
             enable_expert_parallel=params.get("enable_expert_parallel", False),
         )
@@ -3480,8 +3600,16 @@ select { cursor: pointer; }
           <span class="param-tip" data-tip="Percorso dove verra' installato vLLM. Il venv Python sara' creato in <dir>/.vllm. Richiede almeno 50 GB di spazio libero.">?</span>
         </div>
       </div>
+      <div id="wiz-install-check-box" style="margin-top:16px;padding:12px;border-radius:8px;border:1px solid var(--bg3);display:none">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span id="wiz-install-check-icon" style="font-size:18px"></span>
+          <strong id="wiz-install-check-title"></strong>
+        </div>
+        <div id="wiz-install-check-details" style="font-size:12px;color:var(--fg3)"></div>
+      </div>
       <div class="btn-row" style="margin-top:16px">
-        <button class="btn btn-primary" onclick="wizStartInstall()">Avvia Installazione</button>
+        <button class="btn btn-primary" id="wiz-btn-install" onclick="wizStartInstall(false)">Avvia Installazione</button>
+        <button class="btn" id="wiz-btn-force-install" onclick="wizStartInstall(true)" style="display:none;background:var(--orange);color:#000">Forza Reinstallazione</button>
         <span id="wiz-install-status" style="font-size:12px;color:var(--fg3);align-self:center"></span>
       </div>
       <div id="wiz-install-info" style="margin-top:8px;font-size:12px;color:var(--fg3)"></div>
@@ -4441,6 +4569,7 @@ function wizShowStep(n) {
   }
   wizUpdateStepper();
   // Auto-load for specific steps
+  if (n === 1) wizCheckInstallation();
   if (n === 2 && !wizParamsSchema) wizLoadParamsSchema();
   if (n === 4) wizLoadWorkersList();
   if (n === 5) wizRenderSummary();
@@ -4574,15 +4703,60 @@ async function wizSaveInstallConfig() {
   try { await apiPost('/api/dgx/wizard/install-config', data); } catch(e) {}
 }
 
-async function wizStartInstall() {
+async function wizCheckInstallation() {
+  const box = document.getElementById('wiz-install-check-box');
+  const icon = document.getElementById('wiz-install-check-icon');
+  const title = document.getElementById('wiz-install-check-title');
+  const details = document.getElementById('wiz-install-check-details');
+  const btnInstall = document.getElementById('wiz-btn-install');
+  const btnForce = document.getElementById('wiz-btn-force-install');
+  box.style.display = 'block';
+  icon.textContent = '...';
+  title.textContent = 'Verifica installazione in corso...';
+  details.textContent = '';
+  try {
+    const r = await apiGet('/api/dgx/wizard/install-check');
+    if (r.installed) {
+      icon.textContent = '\u2705';
+      title.textContent = 'vLLM gia\u0027 installato';
+      title.style.color = 'var(--green)';
+      let det = 'vLLM ' + r.vllm_version + ' | PyTorch ' + r.torch_version;
+      det += ' | CUDA: ' + (r.cuda_available ? 'OK' : 'NON DISPONIBILE');
+      det += ' | Path: ' + r.path;
+      details.textContent = det;
+      if (!r.cuda_available) {
+        details.style.color = 'var(--orange)';
+        details.textContent += ' \u26a0\ufe0f PyTorch senza CUDA, reinstallazione consigliata';
+      }
+      btnInstall.textContent = 'Salta (gia\u0027 installato)';
+      btnInstall.onclick = function() { wizShowStep(2); };
+      btnForce.style.display = '';
+    } else {
+      icon.textContent = '\u26a0\ufe0f';
+      title.textContent = 'vLLM non trovato';
+      title.style.color = 'var(--orange)';
+      details.textContent = 'Path verificato: ' + r.path;
+      btnInstall.textContent = 'Avvia Installazione';
+      btnInstall.onclick = function() { wizStartInstall(false); };
+      btnForce.style.display = 'none';
+    }
+  } catch(e) {
+    icon.textContent = '\u274c';
+    title.textContent = 'Errore verifica';
+    title.style.color = 'var(--red)';
+    details.textContent = e.message;
+  }
+}
+
+async function wizStartInstall(force) {
   await wizSaveInstallConfig();
   const statusEl = document.getElementById('wiz-install-status');
   const infoEl = document.getElementById('wiz-install-info');
-  statusEl.textContent = 'Installazione avviata...';
+  statusEl.textContent = force ? 'Reinstallazione avviata...' : 'Installazione avviata...';
   statusEl.style.color = 'var(--orange)';
   infoEl.textContent = 'Questa operazione richiede 20-30 minuti. Controlla i log nel tab Logs.';
   try {
-    await apiPost('/api/dgx/wizard/install-start', {});
+    await apiPost('/api/dgx/wizard/install-start', { force: !!force });
     // Poll status
     const poll = setInterval(async () => {
       try {
@@ -4593,6 +4767,7 @@ async function wizStartInstall() {
           statusEl.style.color = 'var(--green)';
           infoEl.textContent = '';
           showToast('Installazione vLLM completata', 'success');
+          wizCheckInstallation();
         } else if (s.status === 'error') {
           clearInterval(poll);
           statusEl.textContent = 'Errore installazione';
