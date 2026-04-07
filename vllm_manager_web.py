@@ -524,6 +524,416 @@ DGX_MULTINODE_PRESETS = [
 
 
 # ---------------------------------------------------------------------------
+# 5b. Wizard Parameter Schema
+# ---------------------------------------------------------------------------
+
+DGX_WIZARD_PARAMS_SCHEMA = [
+    {
+        "key": "model_config", "label": "Configurazione Modello",
+        "params": [
+            {
+                "key": "model", "type": "text", "default": "",
+                "label": "Modello",
+                "tooltip": "ID del modello HuggingFace o percorso locale al modello. "
+                           "Esempio: meta-llama/Llama-3.3-70B-Instruct. "
+                           "Recuperabile da https://huggingface.co/models filtrando per 'text-generation'.",
+                "dgx_tip": "Su DGX Spark (128 GB VRAM unificata) si possono caricare modelli fino a ~70B in full precision "
+                           "o ~140B con quantizzazione NVFP4. Per multi-nodo (2 Spark) fino a ~140B full o 405B quantizzato.",
+                "required": True,
+            },
+            {
+                "key": "tokenizer", "type": "text", "default": "",
+                "label": "Tokenizer",
+                "tooltip": "Nome o percorso del tokenizer HuggingFace. Se vuoto, usa quello incluso nel modello. "
+                           "Specificare solo se il tokenizer e' diverso dal modello (raro).",
+                "dgx_tip": "Lasciare vuoto nella quasi totalita' dei casi.",
+            },
+            {
+                "key": "dtype", "type": "select", "default": "auto",
+                "options": ["auto", "float16", "bfloat16", "float32"],
+                "label": "Tipo Dati (dtype)",
+                "tooltip": "Tipo dati per i pesi del modello. 'auto' usa il tipo originale definito nel config del modello. "
+                           "float16: 16-bit floating point. bfloat16: Brain Float 16 (migliore range). "
+                           "float32: 32-bit, doppia memoria ma massima precisione.",
+                "dgx_tip": "Il GPU Blackwell GB10 supporta bfloat16 nativamente. 'auto' e' la scelta consigliata. "
+                           "Usare float16 solo se il modello lo richiede esplicitamente.",
+            },
+            {
+                "key": "max_model_len", "type": "number", "default": 0,
+                "label": "Lunghezza Max Contesto",
+                "tooltip": "Lunghezza massima della sequenza (context window) in token. 0 = automatico dal config del modello. "
+                           "Valori comuni: 2048, 4096, 8192, 32768, 131072. "
+                           "Ridurre questo valore riduce significativamente l'uso di VRAM.",
+                "dgx_tip": "Su DGX Spark con modelli grandi (70B), ridurre a 4096-8192 per risparmiare VRAM. "
+                           "Per Llama-3.3-70B il default e' 131072 ma richiede molta memoria. Iniziare con 8192.",
+            },
+            {
+                "key": "trust_remote_code", "type": "checkbox", "default": False,
+                "label": "Trust Remote Code",
+                "tooltip": "Permette l'esecuzione di codice Python personalizzato contenuto nel repository del modello. "
+                           "Necessario per alcuni modelli (Qwen, Phi, DeepSeek) che definiscono architetture custom.",
+                "dgx_tip": "Attivare per modelli Qwen, Phi-3, DeepSeek-V2 e altri con architetture custom. "
+                           "Attenzione: esegue codice non verificato. Usare solo con modelli fidati.",
+            },
+            {
+                "key": "revision", "type": "text", "default": "",
+                "label": "Revisione Modello",
+                "tooltip": "Commit hash, branch o tag specifico del modello su HuggingFace. "
+                           "Se vuoto, usa la revisione 'main' (ultima disponibile). "
+                           "Utile per fissare una versione specifica del modello.",
+                "dgx_tip": "Lasciare vuoto per usare l'ultima versione. Specificare un hash solo per riproducibilita'.",
+            },
+            {
+                "key": "quantization", "type": "select", "default": "",
+                "options": ["", "awq", "gptq", "squeezellm", "fp8", "nvfp4", "marlin", "bitsandbytes"],
+                "label": "Quantizzazione",
+                "tooltip": "Metodo di quantizzazione dei pesi. Riduce VRAM a scapito di qualita'. "
+                           "AWQ/GPTQ: quantizzazione 4-bit pre-calcolata (il modello deve essere gia' quantizzato). "
+                           "FP8: 8-bit floating point. NVFP4: NVIDIA FP4 nativo. "
+                           "Se vuoto, nessuna quantizzazione (pesi originali).",
+                "dgx_tip": "NVFP4 e' supportato nativamente su Blackwell (sm_121) ed offre il miglior rapporto qualita'/compressione. "
+                           "FP8 e' un buon compromesso. Per modelli >70B su singolo Spark, considerare fp8 o nvfp4.",
+            },
+            {
+                "key": "enforce_eager", "type": "checkbox", "default": False,
+                "label": "Forza Eager Mode",
+                "tooltip": "Disabilita CUDA graph capturing e forza l'esecuzione eager. "
+                           "CUDA graphs accelerano l'inferenza ma usano piu' memoria e possono causare problemi di compatibilita'. "
+                           "Utile per debugging o quando si verificano errori CUDA.",
+                "dgx_tip": "Lasciare disattivato in produzione. Attivare temporaneamente se si verificano "
+                           "errori di CUDA graph o comportamenti anomali.",
+            },
+            {
+                "key": "seed", "type": "number", "default": 0,
+                "label": "Seed Random",
+                "tooltip": "Seed per il generatore di numeri random. 0 = seed casuale ad ogni avvio. "
+                           "Impostare un valore fisso per ottenere risultati riproducibili.",
+                "dgx_tip": "Lasciare 0 per uso normale. Impostare un valore fisso solo per test di riproducibilita'.",
+            },
+        ],
+    },
+    {
+        "key": "memory_perf", "label": "Memoria & Performance",
+        "params": [
+            {
+                "key": "gpu_memory_utilization", "type": "range", "default": 0.90,
+                "min": 0.5, "max": 0.99, "step": 0.01,
+                "label": "Utilizzo Memoria GPU",
+                "tooltip": "Frazione della memoria GPU da dedicare alla KV cache (0.5 - 0.99). "
+                           "Il resto e' usato per i pesi del modello e overhead. "
+                           "Valori alti = piu' sequenze in parallelo. Troppo alto = rischio OOM.",
+                "dgx_tip": "Su DGX Spark: 0.90 e' bilanciato. Aumentare a 0.95 per modelli grandi che servono piu' cache. "
+                           "Ridurre a 0.80 se si verificano errori Out-Of-Memory.",
+            },
+            {
+                "key": "cpu_offload_gb", "type": "number", "default": 0,
+                "label": "CPU Offload (GB)",
+                "tooltip": "Gigabyte di pesi del modello da scaricare sulla RAM CPU. 0 = tutto su GPU. "
+                           "Permette di caricare modelli piu' grandi della VRAM a scapito della velocita'. "
+                           "Richiede RAM sufficiente.",
+                "dgx_tip": "DGX Spark ha 128 GB di memoria unificata (UMA). Il CPU offload puo' essere utile "
+                           "per modelli molto grandi, ma su architettura UMA l'impatto e' minore rispetto a sistemi discreti.",
+            },
+            {
+                "key": "kv_cache_dtype", "type": "select", "default": "auto",
+                "options": ["auto", "fp8", "fp8_e5m2", "fp8_e4m3"],
+                "label": "Tipo Dati KV Cache",
+                "tooltip": "Tipo dati per la Key-Value cache. 'auto' usa lo stesso tipo dei pesi del modello. "
+                           "FP8 dimezza la memoria della KV cache, permettendo piu' sequenze in parallelo. "
+                           "fp8_e4m3: 4 bit mantissa (piu' preciso). fp8_e5m2: 5 bit esponente (piu' range).",
+                "dgx_tip": "Su Blackwell, fp8_e4m3 e' supportato nativamente e offre un buon compromesso. "
+                           "Usare fp8 per raddoppiare il throughput con modelli grandi.",
+            },
+            {
+                "key": "block_size", "type": "select", "default": 16,
+                "options": [8, 16, 32],
+                "label": "Dimensione Blocco KV Cache",
+                "tooltip": "Numero di token per blocco nella KV cache (PagedAttention). "
+                           "Blocchi piu' grandi = meno overhead di gestione, ma piu' spreco di memoria interna. "
+                           "Valori: 8, 16, 32.",
+                "dgx_tip": "16 e' il default ottimale per la maggior parte dei casi su DGX Spark.",
+            },
+            {
+                "key": "enable_prefix_caching", "type": "checkbox", "default": True,
+                "label": "Prefix Caching",
+                "tooltip": "Riutilizza la KV cache per prefissi di prompt identici tra richieste diverse. "
+                           "Migliora significativamente il throughput quando piu' richieste condividono lo stesso system prompt "
+                           "o contesto iniziale.",
+                "dgx_tip": "Consigliato attivo. Particolarmente utile con system prompt lunghi o RAG.",
+            },
+            {
+                "key": "calculate_kv_scales", "type": "checkbox", "default": False,
+                "label": "Calcola Scale KV",
+                "tooltip": "Calcola automaticamente i fattori di scala per la KV cache quantizzata. "
+                           "Necessario quando kv_cache_dtype e' impostato su fp8. "
+                           "Aggiunge un piccolo overhead al primo avvio.",
+                "dgx_tip": "Attivare se si usa kv_cache_dtype=fp8. Non necessario con 'auto'.",
+                "advanced": True,
+            },
+        ],
+    },
+    {
+        "key": "parallelism", "label": "Parallelismo",
+        "params": [
+            {
+                "key": "tensor_parallel_size", "type": "number", "default": 1,
+                "min": 1, "max": 8,
+                "label": "Tensor Parallel Size",
+                "tooltip": "Numero di GPU su cui suddividere i pesi del modello (tensor parallelism). "
+                           "Ogni GPU elabora una porzione dei tensori. Richiede Ray per valori > 1 su multi-nodo. "
+                           "Deve dividere equamente il numero di attention head del modello.",
+                "dgx_tip": "DGX Spark ha 1 GPU per nodo. Usare 1 per singolo nodo, 2 per due Spark collegati via QSFP. "
+                           "Per 4 nodi: tp_size=4. Richiede Ray cluster configurato.",
+            },
+            {
+                "key": "pipeline_parallel_size", "type": "number", "default": 1,
+                "min": 1, "max": 8,
+                "label": "Pipeline Parallel Size",
+                "tooltip": "Numero di stadi di pipeline parallelism. Distribuisce i layer del modello su piu' GPU in sequenza. "
+                           "Complementare al tensor parallelism. tp_size * pp_size = totale GPU. "
+                           "Pipeline parallelism e' meno efficiente ma supporta piu' GPU.",
+                "dgx_tip": "Usare per modelli enormi (405B+) quando il tensor parallelism da solo non basta. "
+                           "Preferire tensor parallelism quando possibile.",
+            },
+            {
+                "key": "data_parallel_size", "type": "number", "default": 1,
+                "min": 1, "max": 8,
+                "label": "Data Parallel Size",
+                "tooltip": "Numero di repliche del modello per data parallelism. "
+                           "Ogni replica gestisce richieste indipendentemente, moltiplicando il throughput. "
+                           "Richiede dp_size * tp_size * pp_size GPU totali.",
+                "dgx_tip": "Utile solo con molti nodi. Su 2 Spark collegati, preferire tp_size=2 piuttosto che dp_size=2.",
+                "advanced": True,
+            },
+            {
+                "key": "distributed_executor_backend", "type": "select", "default": "auto",
+                "options": ["auto", "ray", "mp"],
+                "label": "Backend Esecuzione Distribuita",
+                "tooltip": "Backend per l'esecuzione distribuita. 'auto' sceglie automaticamente. "
+                           "'ray': usa Ray per orchestrazione multi-nodo (richiede Ray installato e cluster attivo). "
+                           "'mp': usa multiprocessing Python (solo singolo nodo, piu' GPU).",
+                "dgx_tip": "Per multi-nodo DGX Spark: usare 'ray' (richiede cluster Ray configurato nel tab DGX Spark). "
+                           "Per singolo nodo: 'auto' o 'mp'.",
+            },
+            {
+                "key": "enable_expert_parallel", "type": "checkbox", "default": False,
+                "label": "Expert Parallelism",
+                "tooltip": "Abilita parallelismo degli esperti per modelli Mixture-of-Experts (MoE). "
+                           "Distribuisce i diversi 'esperti' del modello su GPU separate. "
+                           "Applicabile solo a modelli MoE come Mixtral, DeepSeek-V2, DBRX.",
+                "dgx_tip": "Attivare per Mixtral-8x22B, DeepSeek-V2-MoE e simili. "
+                           "Non ha effetto su modelli densi (Llama, Qwen standard).",
+                "advanced": True,
+            },
+            {
+                "key": "max_parallel_loading_workers", "type": "number", "default": 0,
+                "min": 0, "max": 16,
+                "label": "Worker Caricamento Parallelo",
+                "tooltip": "Numero di worker paralleli per caricare i pesi del modello. 0 = automatico. "
+                           "Valori piu' alti velocizzano il caricamento su storage veloci (NVMe). "
+                           "Usa piu' RAM durante il caricamento.",
+                "dgx_tip": "Lasciare 0 per la maggior parte dei casi. Aumentare a 4-8 se il caricamento e' lento.",
+                "advanced": True,
+            },
+            {
+                "key": "nnodes", "type": "number", "default": 1,
+                "min": 1, "max": 8,
+                "label": "Numero Nodi",
+                "tooltip": "Numero totale di nodi nel cluster distribuito. "
+                           "Deve corrispondere al numero di macchine DGX Spark collegate. "
+                           "Richiede Ray cluster attivo con tutti i nodi connessi.",
+                "dgx_tip": "Impostare al numero di DGX Spark collegati. 1 = singolo nodo. "
+                           "2 = due Spark con QSFP. Verificare che tutti i worker siano in stato 'Ray Connesso'.",
+            },
+        ],
+    },
+    {
+        "key": "serving", "label": "Serving & Scheduling",
+        "params": [
+            {
+                "key": "host", "type": "text", "default": "0.0.0.0",
+                "label": "Host",
+                "tooltip": "Indirizzo IP su cui il server ascolta. '0.0.0.0' accetta connessioni da qualsiasi IP. "
+                           "'127.0.0.1' solo connessioni locali. Specificare un IP per limitare l'accesso.",
+                "dgx_tip": "Usare '0.0.0.0' per rendere il server accessibile dalla rete locale.",
+            },
+            {
+                "key": "port", "type": "number", "default": 8000,
+                "min": 1024, "max": 65535,
+                "label": "Porta",
+                "tooltip": "Porta HTTP su cui il server espone l'API compatibile OpenAI. "
+                           "L'API sara' disponibile su http://<host>:<port>/v1/chat/completions. "
+                           "Evitare porte gia' in uso (5000 = manager, 8265 = Ray dashboard).",
+                "dgx_tip": "8000 e' il default standard. Cambiare se si avviano piu' istanze vLLM sullo stesso nodo.",
+            },
+            {
+                "key": "max_num_seqs", "type": "number", "default": 256,
+                "label": "Max Sequenze in Batch",
+                "tooltip": "Numero massimo di sequenze elaborate contemporaneamente in un batch. "
+                           "Valori alti = piu' throughput ma piu' latenza per singola richiesta. "
+                           "Valori bassi = meno throughput ma latenza piu' bassa.",
+                "dgx_tip": "Per modelli grandi (70B): ridurre a 32-64. Per modelli piccoli (7B): 128-256. "
+                           "Bilanciare in base al carico previsto.",
+            },
+            {
+                "key": "max_num_batched_tokens", "type": "number", "default": 0,
+                "label": "Max Token per Batch",
+                "tooltip": "Numero massimo di token elaborati in una singola iterazione del motore. "
+                           "0 = automatico (calcolato da max_model_len e max_num_seqs). "
+                           "Controlla il bilanciamento throughput vs latenza.",
+                "dgx_tip": "Lasciare 0 per calcolo automatico. Ridurre se si verificano spike di latenza.",
+                "advanced": True,
+            },
+            {
+                "key": "enable_chunked_prefill", "type": "checkbox", "default": False,
+                "label": "Chunked Prefill",
+                "tooltip": "Divide il prefill di prompt lunghi in chunk piu' piccoli. "
+                           "Riduce la latenza del primo token (TTFT) per prompt molto lunghi "
+                           "permettendo ad altre richieste di essere servite durante il prefill.",
+                "dgx_tip": "Consigliato per servire prompt lunghi (>4K token) con bassa latenza. "
+                           "Leggero overhead sul throughput totale.",
+            },
+            {
+                "key": "chat_template", "type": "select", "default": "",
+                "options": ["", "llama-2", "mistral", "chatml"],
+                "label": "Template Chat",
+                "tooltip": "Template per formattare i messaggi di chat. Vuoto = auto-detect dal tokenizer del modello. "
+                           "llama-2: formato [INST][/INST]. mistral: formato Mistral. chatml: formato <|im_start|>. "
+                           "La maggior parte dei modelli moderni include il template nel tokenizer.",
+                "dgx_tip": "Lasciare vuoto (auto) per la maggior parte dei modelli recenti. "
+                           "Specificare solo se il modello non include un template o se si vuole forzarne uno diverso.",
+            },
+            {
+                "key": "scheduling_policy", "type": "select", "default": "fcfs",
+                "options": ["fcfs", "priority"],
+                "label": "Politica Scheduling",
+                "tooltip": "Politica di scheduling delle richieste. "
+                           "'fcfs' (First Come First Served): le richieste sono elaborate nell'ordine di arrivo. "
+                           "'priority': le richieste possono avere priorita' diverse (richiede API priority).",
+                "dgx_tip": "FCFS e' adatto per la maggior parte degli scenari. "
+                           "Priority utile per ambienti multi-utente con SLA diversi.",
+                "advanced": True,
+            },
+        ],
+    },
+    {
+        "key": "attention", "label": "Attention & Backend",
+        "params": [
+            {
+                "key": "attention_backend", "type": "select", "default": "",
+                "options": ["", "TRITON_ATTN", "FLASHINFER", "XFORMERS"],
+                "label": "Backend Attention",
+                "tooltip": "Implementazione del meccanismo di attenzione. Vuoto = auto-select. "
+                           "TRITON_ATTN: implementazione Triton, compatibile con piu' architetture. "
+                           "FLASHINFER: ottimizzato per throughput, richiede libreria flashinfer. "
+                           "XFORMERS: libreria xFormers di Meta.",
+                "dgx_tip": "Su DGX Spark (Blackwell sm_121): TRITON_ATTN e' il piu' compatibile e testato. "
+                           "FLASHINFER puo' offrire performance migliori ma potrebbe richiedere build custom. "
+                           "Impostato via variabile d'ambiente VLLM_ATTENTION_BACKEND.",
+            },
+            {
+                "key": "disable_cascade_attn", "type": "checkbox", "default": False,
+                "label": "Disabilita Cascade Attention",
+                "tooltip": "Disabilita l'ottimizzazione cascade attention che separa il computo tra prefix cache "
+                           "e token nuovi. Utile se causa instabilita' o risultati incorretti.",
+                "dgx_tip": "Lasciare disattivato (cascade attivo). Attivare solo se si verificano problemi.",
+                "advanced": True,
+            },
+            {
+                "key": "disable_sliding_window", "type": "checkbox", "default": False,
+                "label": "Disabilita Sliding Window",
+                "tooltip": "Disabilita l'attenzione a finestra scorrevole (sliding window attention). "
+                           "Alcuni modelli (Mistral, Phi) usano SWA per ridurre la complessita'. "
+                           "Disabilitare forza full attention su tutta la sequenza.",
+                "dgx_tip": "Lasciare disattivato. Attivare solo se richiesto per compatibilita' specifica.",
+                "advanced": True,
+            },
+        ],
+    },
+    {
+        "key": "lora", "label": "LoRA",
+        "params": [
+            {
+                "key": "enable_lora", "type": "checkbox", "default": False,
+                "label": "Abilita LoRA",
+                "tooltip": "Abilita il caricamento di adattatori LoRA (Low-Rank Adaptation) a runtime. "
+                           "Permette di servire modelli fine-tuned senza duplicare i pesi base. "
+                           "Richiede adattatori LoRA compatibili con il modello base.",
+                "dgx_tip": "Utile per servire varianti fine-tuned dello stesso modello base. "
+                           "Aggiunge un piccolo overhead di memoria per ogni adattatore caricato.",
+                "advanced": True,
+            },
+            {
+                "key": "max_loras", "type": "number", "default": 1,
+                "min": 1, "max": 64,
+                "label": "Max Adattatori LoRA",
+                "tooltip": "Numero massimo di adattatori LoRA che possono essere caricati simultaneamente. "
+                           "Ogni adattatore aggiunge memoria proporzionale al suo rank.",
+                "dgx_tip": "Aumentare se si servono molti utenti con adattatori diversi.",
+                "advanced": True,
+            },
+            {
+                "key": "max_lora_rank", "type": "number", "default": 16,
+                "min": 1, "max": 256,
+                "label": "Max LoRA Rank",
+                "tooltip": "Rank massimo supportato per gli adattatori LoRA. Valori comuni: 8, 16, 32, 64. "
+                           "Rank piu' alto = adattatore piu' espressivo ma piu' memoria.",
+                "dgx_tip": "16 e' sufficiente per la maggior parte dei casi. Aumentare a 32-64 per adattatori complessi.",
+                "advanced": True,
+            },
+        ],
+    },
+    {
+        "key": "speculative", "label": "Speculative Decoding",
+        "params": [
+            {
+                "key": "speculative_model", "type": "text", "default": "",
+                "label": "Modello Draft",
+                "tooltip": "ID HuggingFace del modello 'draft' per speculative decoding. "
+                           "Deve essere un modello piu' piccolo e veloce dello stesso tipo (es. 1B per un modello 70B). "
+                           "Se vuoto, speculative decoding e' disabilitato.",
+                "dgx_tip": "Esempio: per Llama-3.3-70B usare meta-llama/Llama-3.2-1B-Instruct come draft. "
+                           "Puo' aumentare il throughput del 30-50% per generazione lunga.",
+                "advanced": True,
+            },
+            {
+                "key": "num_speculative_tokens", "type": "number", "default": 0,
+                "min": 0, "max": 20,
+                "label": "Token Speculativi",
+                "tooltip": "Numero di token generati speculativamente dal modello draft per ogni iterazione. "
+                           "0 = disabilitato. Valori tipici: 3-5. "
+                           "Piu' alto = piu' speedup potenziale ma piu' token da verificare.",
+                "dgx_tip": "3-5 e' un buon compromesso. Valori troppo alti riducono il tasso di accettazione.",
+                "advanced": True,
+            },
+        ],
+    },
+    {
+        "key": "observability", "label": "Osservabilita'",
+        "params": [
+            {
+                "key": "disable_log_stats", "type": "checkbox", "default": False,
+                "label": "Disabilita Statistiche Log",
+                "tooltip": "Disabilita la stampa di statistiche periodiche nei log (throughput, latenza, code). "
+                           "Riduce il volume dei log in produzione.",
+                "dgx_tip": "Lasciare disattivato durante il setup per monitorare le performance. "
+                           "Attivare in produzione se i log sono troppo verbosi.",
+                "advanced": True,
+            },
+            {
+                "key": "enable_metrics", "type": "checkbox", "default": True,
+                "label": "Abilita Metriche KV Cache",
+                "tooltip": "Abilita le metriche dettagliate sulla KV cache (occupazione, hit rate del prefix caching). "
+                           "Utile per monitoraggio ma aggiunge un leggero overhead.",
+                "dgx_tip": "Consigliato attivo durante il tuning iniziale. Disattivare per massime performance.",
+                "advanced": True,
+            },
+        ],
+    },
+]
+
+
+# ---------------------------------------------------------------------------
 # 6. Config
 # ---------------------------------------------------------------------------
 
@@ -587,6 +997,20 @@ class ConfigManager:
             w["status"] = status
             self.save()
 
+    # --- Wizard state ---
+
+    def get_wizard(self):
+        return self.data.setdefault("wizard", {})
+
+    def save_wizard_step(self, step_key, step_data):
+        wiz = self.data.setdefault("wizard", {})
+        wiz[step_key] = step_data
+        self.save()
+
+    def reset_wizard(self):
+        self.data["wizard"] = {}
+        self.save()
+
 
 # ---------------------------------------------------------------------------
 # 7. Docker
@@ -626,7 +1050,19 @@ class VLLMProcess:
     def start(self, model, gpu_mem_util=0.90, max_model_len=None,
               dtype="auto", enable_prefix_caching=True, extra_args="",
               host="0.0.0.0", port=8000, chat_template="",
-              tp_size=1, attention_backend=""):
+              tp_size=1, attention_backend="",
+              # Wizard params
+              pp_size=1, dp_size=None, max_num_seqs=None,
+              max_num_batched_tokens=None, enable_chunked_prefill=False,
+              kv_cache_dtype=None, block_size=None, cpu_offload_gb=None,
+              trust_remote_code=False, enforce_eager=False,
+              quantization=None, seed=None, tokenizer=None,
+              enable_lora=False, max_loras=None, max_lora_rank=None,
+              speculative_model=None, num_speculative_tokens=None,
+              distributed_executor_backend=None, nnodes=1,
+              scheduling_policy=None, disable_log_stats=False,
+              disable_cascade_attn=False, disable_sliding_window=False,
+              enable_expert_parallel=False):
         if self.running:
             return
 
@@ -655,6 +1091,56 @@ class VLLMProcess:
                 parts.append("--enable-prefix-caching")
             if tp_size > 1:
                 parts.append("--tensor-parallel-size %d" % tp_size)
+            if pp_size and pp_size > 1:
+                parts.append("--pipeline-parallel-size %d" % pp_size)
+            if dp_size and dp_size > 1:
+                parts.append("--data-parallel-size %d" % dp_size)
+            if max_num_seqs:
+                parts.append("--max-num-seqs %d" % max_num_seqs)
+            if max_num_batched_tokens:
+                parts.append("--max-num-batched-tokens %d" % max_num_batched_tokens)
+            if enable_chunked_prefill:
+                parts.append("--enable-chunked-prefill")
+            if kv_cache_dtype and kv_cache_dtype != "auto":
+                parts.append("--kv-cache-dtype %s" % kv_cache_dtype)
+            if block_size and block_size != 16:
+                parts.append("--block-size %d" % block_size)
+            if cpu_offload_gb and cpu_offload_gb > 0:
+                parts.append("--cpu-offload-gb %.1f" % cpu_offload_gb)
+            if trust_remote_code:
+                parts.append("--trust-remote-code")
+            if enforce_eager:
+                parts.append("--enforce-eager")
+            if quantization:
+                parts.append("--quantization %s" % quantization)
+            if seed and seed > 0:
+                parts.append("--seed %d" % seed)
+            if tokenizer:
+                parts.append("--tokenizer '%s'" % tokenizer)
+            if enable_lora:
+                parts.append("--enable-lora")
+                if max_loras and max_loras > 1:
+                    parts.append("--max-loras %d" % max_loras)
+                if max_lora_rank and max_lora_rank != 16:
+                    parts.append("--max-lora-rank %d" % max_lora_rank)
+            if speculative_model:
+                parts.append("--speculative-model '%s'" % speculative_model)
+                if num_speculative_tokens and num_speculative_tokens > 0:
+                    parts.append("--num-speculative-tokens %d" % num_speculative_tokens)
+            if distributed_executor_backend and distributed_executor_backend != "auto":
+                parts.append("--distributed-executor-backend %s" % distributed_executor_backend)
+            if nnodes and nnodes > 1:
+                parts.append("--nnodes %d" % nnodes)
+            if scheduling_policy and scheduling_policy != "fcfs":
+                parts.append("--scheduling-policy %s" % scheduling_policy)
+            if disable_log_stats:
+                parts.append("--disable-log-stats")
+            if disable_cascade_attn:
+                parts.append("--disable-cascade-attn")
+            if disable_sliding_window:
+                parts.append("--disable-sliding-window")
+            if enable_expert_parallel:
+                parts.append("--enable-expert-parallel")
 
         if extra_args.strip():
             parts.append(extra_args.strip())
@@ -827,10 +1313,15 @@ def index():
     return render_template_string(HTML_TEMPLATE,
                                   platform=platform_info,
                                   presets=preset_models,
+                                  multinode_presets=DGX_MULTINODE_PRESETS,
                                   is_dgx=platform_info.is_dgx,
                                   is_macos=platform_info.os == "macos",
                                   app_version=APP_VERSION,
-                                  chat_templates=["(auto)"] + [k for k in CHAT_TEMPLATES if k])
+                                  chat_templates=["(auto)"] + [k for k in CHAT_TEMPLATES if k],
+                                  dgx_vllm_commit=DGX_VLLM_COMMIT,
+                                  dgx_triton_commit=DGX_TRITON_COMMIT,
+                                  dgx_pytorch_index=DGX_PYTORCH_INDEX,
+                                  dgx_install_dir=DGX_INSTALL_DIR_DEFAULT)
 
 
 # --- API: Server control ---
@@ -986,9 +1477,12 @@ def _dgx_run_step(msg, cmd, timeout=1800):
     return True
 
 
-def _install_vllm_dgx():
+def _install_vllm_dgx(vllm_commit=None, triton_commit=None, pytorch_index=None, install_dir=None):
     """Full DGX Spark installation: uv, PyTorch, Triton, patched vLLM."""
-    install_dir = DGX_INSTALL_DIR_DEFAULT
+    vllm_commit = vllm_commit or DGX_VLLM_COMMIT
+    triton_commit = triton_commit or DGX_TRITON_COMMIT
+    pytorch_index = pytorch_index or DGX_PYTORCH_INDEX
+    install_dir = install_dir or DGX_INSTALL_DIR_DEFAULT
     venv_dir = install_dir + "/.vllm"
     activate = "source %s/bin/activate" % venv_dir
 
@@ -1035,7 +1529,7 @@ def _install_vllm_dgx():
         "%s && "
         "uv pip install torch torchvision torchaudio --index-url %s && "
         "python -c \"import torch; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'GPU:', torch.cuda.is_available())\"" % (
-            activate, DGX_PYTORCH_INDEX),
+            activate, pytorch_index),
         timeout=600,
     ):
         return
@@ -1056,7 +1550,7 @@ def _install_vllm_dgx():
         "export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) && "
         "python -m pip install --no-build-isolation -v . && "
         "python -c \"import triton; print('Triton:', triton.__version__)\"" % (
-            activate, install_dir, triton_dir, DGX_TRITON_COMMIT),
+            activate, install_dir, triton_dir, triton_commit),
         timeout=1800,
     ):
         return
@@ -1079,7 +1573,7 @@ def _install_vllm_dgx():
         "(test -d vllm || git clone --recursive https://github.com/vllm-project/vllm.git) && "
         "cd vllm && "
         "git checkout %s && "
-        "git submodule update --init --recursive" % (install_dir, DGX_VLLM_COMMIT),
+        "git submodule update --init --recursive" % (install_dir, vllm_commit),
         timeout=300,
     ):
         return
@@ -1693,7 +2187,7 @@ def _install_vllm_dgx_remote(ip, user):
         "%s && "
         "uv pip install torch torchvision torchaudio --index-url %s && "
         "python -c \"import torch; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'GPU:', torch.cuda.is_available())\"" % (
-            activate, DGX_PYTORCH_INDEX),
+            activate, pytorch_index),
         ip, user, timeout=600,
     ):
         return False
@@ -1714,7 +2208,7 @@ def _install_vllm_dgx_remote(ip, user):
         "export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) && "
         "python -m pip install --no-build-isolation -v . && "
         "python -c \"import triton; print('Triton:', triton.__version__)\"" % (
-            activate, install_dir, triton_dir, DGX_TRITON_COMMIT),
+            activate, install_dir, triton_dir, triton_commit),
         ip, user, timeout=1800,
     ):
         return False
@@ -1737,7 +2231,7 @@ def _install_vllm_dgx_remote(ip, user):
         "(test -d vllm || git clone --recursive https://github.com/vllm-project/vllm.git) && "
         "cd vllm && "
         "git checkout %s && "
-        "git submodule update --init --recursive" % (install_dir, DGX_VLLM_COMMIT),
+        "git submodule update --init --recursive" % (install_dir, vllm_commit),
         ip, user, timeout=300,
     ):
         return False
@@ -2069,6 +2563,356 @@ def api_dgx_ray_stop_cluster():
 
 
 # ---------------------------------------------------------------------------
+# DGX Wizard API
+# ---------------------------------------------------------------------------
+
+# Wizard install state tracking
+_wizard_install_state = {"status": "idle", "step": 0, "error": ""}
+
+
+@app.route("/api/dgx/wizard/state")
+def api_dgx_wizard_state():
+    return jsonify({"wizard": config.get_wizard()})
+
+
+@app.route("/api/dgx/wizard/state", methods=["POST"])
+def api_dgx_wizard_state_save():
+    config.data["wizard"] = request.json.get("wizard", {})
+    config.save()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/dgx/wizard/reset", methods=["POST"])
+def api_dgx_wizard_reset():
+    config.reset_wizard()
+    global _wizard_install_state
+    _wizard_install_state = {"status": "idle", "step": 0, "error": ""}
+    return jsonify({"ok": True})
+
+
+@app.route("/api/dgx/wizard/hw-detect")
+def api_dgx_wizard_hw_detect():
+    """Comprehensive hardware detection for DGX wizard."""
+    results = {}
+
+    # GPU
+    rc, out, _ = runner.run(
+        "nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader", timeout=10)
+    if rc == 0 and out.strip():
+        parts = [x.strip() for x in out.strip().split(",")]
+        results["gpu"] = {
+            "ok": True, "name": parts[0] if len(parts) > 0 else "?",
+            "vram": parts[1] if len(parts) > 1 else "?",
+            "compute_cap": parts[2] if len(parts) > 2 else "?"
+        }
+    else:
+        results["gpu"] = {"ok": False, "info": "GPU non rilevata"}
+
+    # CUDA toolkit
+    rc, out, _ = runner.run(
+        "nvcc --version 2>/dev/null || /usr/local/cuda/bin/nvcc --version 2>/dev/null", timeout=10)
+    if rc == 0:
+        import re as _re
+        m = _re.search(r"release (\S+)", out)
+        results["cuda"] = {"ok": True, "version": m.group(1) if m else out.strip()[:40]}
+    else:
+        results["cuda"] = {"ok": False, "info": "CUDA toolkit (nvcc) non trovato"}
+
+    # Disk space
+    rc, out, _ = runner.run("df -BG $HOME | tail -1 | awk '{print $4}' | sed 's/G//'", timeout=5)
+    free_gb = int(out.strip()) if rc == 0 and out.strip().isdigit() else 0
+    results["disk"] = {"ok": free_gb >= 50, "free_gb": free_gb,
+                        "info": "%d GB liberi" % free_gb + (" (minimo 50 GB)" if free_gb < 50 else "")}
+
+    # RAM
+    rc, out, _ = runner.run("free -g | awk '/Mem:/{print $2}'", timeout=5)
+    ram_gb = int(out.strip()) if rc == 0 and out.strip().isdigit() else 0
+    results["ram"] = {"ok": ram_gb > 0, "total_gb": ram_gb, "info": "%d GB" % ram_gb}
+
+    # Network interfaces (ibdev2netdev)
+    rc, out, _ = runner.run("ibdev2netdev 2>/dev/null || echo 'ibdev2netdev non disponibile'", timeout=5)
+    interfaces = []
+    if rc == 0:
+        for line in out.strip().split("\n"):
+            if line.strip():
+                interfaces.append(line.strip())
+    results["network"] = {"ok": len(interfaces) > 0, "interfaces": interfaces}
+
+    # IP addresses of high-speed interfaces
+    rc, out, _ = runner.run("ip -br addr show 2>/dev/null | grep -E '(enP|enp|mlx)'", timeout=5)
+    ip_addrs = []
+    if rc == 0:
+        for line in out.strip().split("\n"):
+            if line.strip():
+                ip_addrs.append(line.strip())
+    results["ip_addresses"] = ip_addrs
+
+    # NCCL availability
+    rc, out, _ = runner.run(
+        'python3 -c "import torch; print(torch.cuda.nccl.is_available()); '
+        'print(torch.cuda.device_count())" 2>/dev/null', timeout=15)
+    if rc == 0 and "True" in out:
+        lines = out.strip().split("\n")
+        dev_count = lines[1].strip() if len(lines) > 1 else "?"
+        results["nccl"] = {"ok": True, "devices": dev_count}
+    else:
+        results["nccl"] = {"ok": False, "info": "NCCL non disponibile o torch non installato"}
+
+    # Existing installation
+    rc, out, _ = runner.run(
+        "test -d %s && echo 'exists' || echo 'not_found'" % DGX_INSTALL_DIR_DEFAULT, timeout=5)
+    has_install = "exists" in out
+    vllm_ver = ""
+    if has_install:
+        rc2, out2, _ = runner.run(
+            "source %s/.vllm/bin/activate 2>/dev/null && python -c \"import vllm; print(vllm.__version__)\" 2>/dev/null"
+            % DGX_INSTALL_DIR_DEFAULT, timeout=10)
+        if rc2 == 0:
+            vllm_ver = out2.strip()
+    results["existing_install"] = {"found": has_install, "vllm_version": vllm_ver,
+                                    "path": DGX_INSTALL_DIR_DEFAULT}
+
+    return jsonify(results)
+
+
+@app.route("/api/dgx/wizard/params-schema")
+def api_dgx_wizard_params_schema():
+    return jsonify(DGX_WIZARD_PARAMS_SCHEMA)
+
+
+@app.route("/api/dgx/wizard/params-save", methods=["POST"])
+def api_dgx_wizard_params_save():
+    config.save_wizard_step("engine_params", request.json)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/dgx/wizard/install-config", methods=["POST"])
+def api_dgx_wizard_install_config():
+    config.save_wizard_step("install_config", request.json)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/dgx/wizard/install-start", methods=["POST"])
+def api_dgx_wizard_install_start():
+    global _wizard_install_state
+    if _wizard_install_state.get("status") == "running":
+        return jsonify({"error": "Installazione gia' in corso"}), 409
+
+    wiz = config.get_wizard()
+    ic = wiz.get("install_config", {})
+
+    def _run_install():
+        global _wizard_install_state
+        _wizard_install_state = {"status": "running", "step": 0, "error": ""}
+        try:
+            _install_vllm_dgx(
+                vllm_commit=ic.get("vllm_commit") or None,
+                triton_commit=ic.get("triton_commit") or None,
+                pytorch_index=ic.get("pytorch_index") or None,
+                install_dir=ic.get("install_dir") or None,
+            )
+            _wizard_install_state["status"] = "done"
+            config.save_wizard_step("install_status", "done")
+        except Exception as e:
+            _wizard_install_state["status"] = "error"
+            _wizard_install_state["error"] = str(e)
+            config.save_wizard_step("install_status", "error")
+
+    threading.Thread(target=_run_install, daemon=True).start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/api/dgx/wizard/install-status")
+def api_dgx_wizard_install_status():
+    return jsonify(_wizard_install_state)
+
+
+@app.route("/api/dgx/wizard/model-save", methods=["POST"])
+def api_dgx_wizard_model_save():
+    config.save_wizard_step("model_config", request.json)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/dgx/wizard/model-download", methods=["POST"])
+def api_dgx_wizard_model_download():
+    model_id = request.json.get("model", "")
+    if not model_id:
+        return jsonify({"error": "Nessun modello specificato"}), 400
+
+    def _run():
+        log_queue.put("[WIZARD] Download modello: %s\n" % model_id)
+        activate = ""
+        if vllm_detector.activation_cmd:
+            activate = vllm_detector.activation_cmd + " && "
+        rc, out, err = runner.run(
+            "%shuggingface-cli download '%s' 2>&1 || "
+            "python -c \"from huggingface_hub import snapshot_download; snapshot_download('%s')\" 2>&1"
+            % (activate, model_id, model_id), timeout=3600)
+        if rc == 0:
+            log_queue.put("[WIZARD] Download completato: %s\n" % model_id)
+        else:
+            log_queue.put("[ERROR] Download fallito: %s\n" % (err or out)[:200])
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "downloading"})
+
+
+@app.route("/api/dgx/wizard/net-detect")
+def api_dgx_wizard_net_detect():
+    """Detect network interfaces and suggest NCCL configuration."""
+    results = {"interfaces": [], "suggested": {}}
+
+    # ibdev2netdev
+    rc, out, _ = runner.run("ibdev2netdev 2>/dev/null", timeout=5)
+    if rc == 0:
+        for line in out.strip().split("\n"):
+            if line.strip():
+                results["interfaces"].append(line.strip())
+                # Find the Up interface
+                if "(Up)" in line:
+                    parts = line.split()
+                    for i, p in enumerate(parts):
+                        if p.startswith("en") or p.startswith("mlx"):
+                            if_name = p
+                            results["suggested"]["NCCL_SOCKET_IFNAME"] = if_name
+                            results["suggested"]["UCX_NET_DEVICES"] = if_name
+                            results["suggested"]["GLOO_SOCKET_IFNAME"] = if_name
+                            results["suggested"]["TP_SOCKET_IFNAME"] = if_name
+                            break
+                    # IB HCA device
+                    if len(parts) > 0 and parts[0].startswith("mlx"):
+                        results["suggested"]["NCCL_IB_HCA"] = parts[0]
+
+    # IP of interfaces
+    rc, out, _ = runner.run("ip -br addr show 2>/dev/null | grep -E '(enP|enp|mlx)'", timeout=5)
+    if rc == 0:
+        results["ip_info"] = [l.strip() for l in out.strip().split("\n") if l.strip()]
+
+    return jsonify(results)
+
+
+@app.route("/api/dgx/wizard/ray-config", methods=["POST"])
+def api_dgx_wizard_ray_config():
+    config.save_wizard_step("ray_config", request.json)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/dgx/wizard/verify-all", methods=["POST"])
+def api_dgx_wizard_verify_all():
+    """Comprehensive verification: local + remote workers."""
+    results = {"local": {}, "workers": {}}
+
+    # Local GPU
+    rc, out, _ = runner.run(
+        "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader", timeout=10)
+    results["local"]["gpu"] = {"ok": rc == 0, "info": out.strip() if rc == 0 else "GPU non rilevata"}
+
+    # Local vLLM
+    activate = ""
+    if vllm_detector.activation_cmd:
+        activate = vllm_detector.activation_cmd + " && "
+    rc, out, _ = runner.run(
+        '%spython -c "import vllm; print(vllm.__version__)" 2>/dev/null' % activate, timeout=15)
+    results["local"]["vllm"] = {"ok": rc == 0, "info": out.strip() if rc == 0 else "vLLM non installato"}
+
+    # Local Ray
+    rc, out, _ = runner.run(
+        '%spython -c "import ray; print(ray.__version__)" 2>/dev/null' % activate, timeout=15)
+    results["local"]["ray"] = {"ok": rc == 0, "info": out.strip() if rc == 0 else "Ray non installato"}
+
+    # Local NCCL
+    rc, out, _ = runner.run(
+        '%spython -c "import torch; print(torch.cuda.nccl.is_available())" 2>/dev/null' % activate,
+        timeout=15)
+    results["local"]["nccl"] = {"ok": rc == 0 and "True" in out,
+                                 "info": "Disponibile" if (rc == 0 and "True" in out) else "Non disponibile"}
+
+    # Remote workers
+    workers = config.get_workers()
+    for ip, w in workers.items():
+        if w.get("status") in ("installed", "ready", "ray_connected"):
+            wr = _verify_worker(ip, w.get("user", "root"))
+            results["workers"][ip] = wr
+
+    all_local_ok = all(v.get("ok", False) for v in results["local"].values())
+    all_workers_ok = all(
+        all(c.get("ok", False) for c in wr.get("results", {}).values())
+        for wr in results["workers"].values()
+    ) if results["workers"] else True
+
+    results["all_passed"] = all_local_ok and all_workers_ok
+    return jsonify(results)
+
+
+@app.route("/api/dgx/wizard/launch", methods=["POST"])
+def api_dgx_wizard_launch():
+    """Launch vLLM server with full wizard configuration."""
+    wiz = config.get_wizard()
+    params = wiz.get("engine_params", {})
+    model_cfg = wiz.get("model_config", {})
+    ray_cfg = wiz.get("ray_config", {})
+
+    model = params.get("model") or model_cfg.get("model_id", "")
+    if not model:
+        return jsonify({"error": "Nessun modello configurato"}), 400
+
+    # Apply NCCL env vars if configured
+    if ray_cfg and isinstance(runner, DGXCommandRunner):
+        for key in ("NCCL_SOCKET_IFNAME", "UCX_NET_DEVICES", "GLOO_SOCKET_IFNAME",
+                     "NCCL_IB_HCA", "TP_SOCKET_IFNAME"):
+            val = ray_cfg.get(key)
+            if val:
+                runner.dgx_env[key] = val
+        if ray_cfg.get("VLLM_HOST_IP"):
+            runner.dgx_env["VLLM_HOST_IP"] = ray_cfg["VLLM_HOST_IP"]
+        if ray_cfg.get("MASTER_ADDR"):
+            runner.dgx_env["MASTER_ADDR"] = ray_cfg["MASTER_ADDR"]
+
+    try:
+        vllm_proc.start(
+            model=model,
+            gpu_mem_util=float(params.get("gpu_memory_utilization", 0.90)),
+            max_model_len=int(params["max_model_len"]) if params.get("max_model_len") else None,
+            dtype=params.get("dtype", "auto"),
+            enable_prefix_caching=params.get("enable_prefix_caching", True),
+            extra_args="",
+            host=params.get("host", "0.0.0.0"),
+            port=int(params.get("port", 8000)),
+            chat_template=params.get("chat_template", ""),
+            tp_size=int(params.get("tensor_parallel_size", 1)),
+            attention_backend=params.get("attention_backend", ""),
+            pp_size=int(params.get("pipeline_parallel_size", 1)),
+            dp_size=int(params.get("data_parallel_size", 1)) if params.get("data_parallel_size") else None,
+            max_num_seqs=int(params["max_num_seqs"]) if params.get("max_num_seqs") else None,
+            max_num_batched_tokens=int(params["max_num_batched_tokens"]) if params.get("max_num_batched_tokens") else None,
+            enable_chunked_prefill=params.get("enable_chunked_prefill", False),
+            kv_cache_dtype=params.get("kv_cache_dtype"),
+            block_size=int(params["block_size"]) if params.get("block_size") else None,
+            cpu_offload_gb=float(params["cpu_offload_gb"]) if params.get("cpu_offload_gb") else None,
+            trust_remote_code=params.get("trust_remote_code", False),
+            enforce_eager=params.get("enforce_eager", False),
+            quantization=params.get("quantization") or None,
+            seed=int(params["seed"]) if params.get("seed") else None,
+            tokenizer=params.get("tokenizer") or None,
+            enable_lora=params.get("enable_lora", False),
+            max_loras=int(params["max_loras"]) if params.get("max_loras") else None,
+            max_lora_rank=int(params["max_lora_rank"]) if params.get("max_lora_rank") else None,
+            speculative_model=params.get("speculative_model") or None,
+            num_speculative_tokens=int(params["num_speculative_tokens"]) if params.get("num_speculative_tokens") else None,
+            distributed_executor_backend=params.get("distributed_executor_backend") or None,
+            nnodes=int(params.get("nnodes", 1)),
+            scheduling_policy=params.get("scheduling_policy"),
+            disable_log_stats=params.get("disable_log_stats", False),
+            disable_cascade_attn=params.get("disable_cascade_attn", False),
+            disable_sliding_window=params.get("disable_sliding_window", False),
+            enable_expert_parallel=params.get("enable_expert_parallel", False),
+        )
+        return jsonify({"status": "started"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
 # HTML Template
 # ---------------------------------------------------------------------------
 
@@ -2196,6 +3040,67 @@ select { cursor: pointer; }
   .form-row.three { grid-template-columns: 1fr; }
   .tab-panel { padding: 12px; }
 }
+
+/* Wizard */
+.wizard-stepper { display: flex; align-items: center; justify-content: center; gap: 0; padding: 16px 0 24px; }
+.wizard-step-ind { display: flex; flex-direction: column; align-items: center; gap: 4px; cursor: pointer; min-width: 80px; }
+.step-circle { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 14px; border: 2px solid var(--fg3); color: var(--fg3); background: var(--bg2); transition: all .3s; }
+.step-circle.active { border-color: var(--accent); color: var(--accent); background: rgba(122,162,247,.15); }
+.step-circle.completed { border-color: var(--green); color: var(--bg); background: var(--green); }
+.step-circle.error { border-color: var(--red); color: var(--bg); background: var(--red); }
+.step-label { font-size: 11px; color: var(--fg3); white-space: nowrap; }
+.step-label.active { color: var(--accent); font-weight: 600; }
+.step-label.completed { color: var(--green); }
+.step-line { flex: 1; height: 2px; background: var(--fg3); min-width: 20px; max-width: 60px; margin: 0 2px; margin-bottom: 18px; }
+.step-line.completed { background: var(--green); }
+.wizard-panel { display: none; }
+.wizard-panel.active { display: block; }
+.wizard-nav { display: flex; justify-content: space-between; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+
+.param-category { margin-bottom: 16px; }
+.param-category-header { display: flex; align-items: center; gap: 8px; cursor: pointer; padding: 8px 12px;
+  background: var(--bg3); border-radius: var(--radius); font-weight: 600; font-size: 14px; }
+.param-category-header:hover { background: var(--bg4); }
+.param-category-body { padding: 12px 0; }
+.param-row { display: grid; grid-template-columns: 200px 1fr 28px; gap: 8px; align-items: center; padding: 6px 12px; }
+.param-row:hover { background: rgba(122,162,247,.05); border-radius: 4px; }
+.param-row label { font-size: 13px; color: var(--fg2); }
+.param-row input, .param-row select { background: var(--bg2); border: 1px solid var(--border); color: var(--fg);
+  padding: 6px 10px; border-radius: 4px; font-size: 13px; }
+.param-row input[type="range"] { padding: 0; }
+.param-row input[type="checkbox"] { width: 18px; height: 18px; }
+
+.param-tip { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px;
+  border-radius: 50%; background: var(--bg3); color: var(--fg3); font-size: 11px; font-weight: 700;
+  cursor: help; position: relative; flex-shrink: 0; }
+.param-tip:hover { background: var(--accent); color: var(--bg); }
+.param-tip:hover::after { content: attr(data-tip); position: absolute; left: 28px; top: 50%; transform: translateY(-50%);
+  background: var(--bg4); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px;
+  font-size: 12px; font-weight: 400; line-height: 1.5; width: 340px; z-index: 999; white-space: pre-wrap;
+  box-shadow: 0 4px 12px rgba(0,0,0,.4); pointer-events: none; }
+.param-tip:hover::before { content: ''; position: absolute; left: 22px; top: 50%; transform: translateY(-50%);
+  border: 6px solid transparent; border-right-color: var(--border); z-index: 999; }
+
+.advanced-toggle { font-size: 12px; color: var(--accent); cursor: pointer; padding: 4px 12px; }
+.advanced-toggle:hover { text-decoration: underline; }
+.advanced-section { display: none; }
+.advanced-section.show { display: block; }
+
+.hw-check-item { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--bg3); }
+.hw-check-icon { width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700; flex-shrink: 0; }
+.hw-check-icon.pass { background: var(--green); color: var(--bg); }
+.hw-check-icon.fail { background: var(--red); color: var(--bg); }
+.hw-check-icon.warn { background: var(--orange); color: var(--bg); }
+.hw-check-label { font-size: 13px; font-weight: 600; min-width: 120px; }
+.hw-check-value { font-size: 13px; color: var(--fg2); }
+
+.wizard-summary { width: 100%; font-size: 13px; }
+.wizard-summary td { padding: 4px 12px; border-bottom: 1px solid var(--bg3); }
+.wizard-summary td:first-child { color: var(--fg3); width: 200px; }
+
+.range-val { font-size: 12px; color: var(--accent); font-weight: 600; min-width: 40px; text-align: center; }
 </style>
 </head>
 <body>
@@ -2222,6 +3127,7 @@ select { cursor: pointer; }
   <button class="tab-btn" onclick="switchTab('webui')">WebUI</button>
   <button class="tab-btn" onclick="switchTab('profiles')">Profili</button>
   {% if is_dgx %}
+  <button class="tab-btn" onclick="switchTab('dgx-wizard')">Wizard DGX</button>
   <button class="tab-btn" onclick="switchTab('dgx')">DGX Spark</button>
   {% endif %}
 </div>
@@ -2500,6 +3406,220 @@ select { cursor: pointer; }
 </div>
 
 {% if is_dgx %}
+<!-- Tab: Wizard DGX -->
+<div class="tab-panel" id="tab-dgx-wizard">
+
+  <!-- Stepper -->
+  <div class="wizard-stepper" id="wiz-stepper">
+    <div class="wizard-step-ind" onclick="wizGoToStep(0)">
+      <div class="step-circle active" id="wiz-sc-0">1</div>
+      <div class="step-label active" id="wiz-sl-0">Hardware</div>
+    </div><div class="step-line" id="wiz-line-0"></div>
+    <div class="wizard-step-ind" onclick="wizGoToStep(1)">
+      <div class="step-circle" id="wiz-sc-1">2</div>
+      <div class="step-label" id="wiz-sl-1">Installazione</div>
+    </div><div class="step-line" id="wiz-line-1"></div>
+    <div class="wizard-step-ind" onclick="wizGoToStep(2)">
+      <div class="step-circle" id="wiz-sc-2">3</div>
+      <div class="step-label" id="wiz-sl-2">Parametri</div>
+    </div><div class="step-line" id="wiz-line-2"></div>
+    <div class="wizard-step-ind" onclick="wizGoToStep(3)">
+      <div class="step-circle" id="wiz-sc-3">4</div>
+      <div class="step-label" id="wiz-sl-3">Modello</div>
+    </div><div class="step-line" id="wiz-line-3"></div>
+    <div class="wizard-step-ind" onclick="wizGoToStep(4)">
+      <div class="step-circle" id="wiz-sc-4">5</div>
+      <div class="step-label" id="wiz-sl-4">Ray Cluster</div>
+    </div><div class="step-line" id="wiz-line-4"></div>
+    <div class="wizard-step-ind" onclick="wizGoToStep(5)">
+      <div class="step-circle" id="wiz-sc-5">6</div>
+      <div class="step-label" id="wiz-sl-5">Verifica</div>
+    </div>
+  </div>
+
+  <!-- Step 0: Hardware Detection -->
+  <div class="wizard-panel active" id="wiz-step-0">
+    <div class="card">
+      <h3>Rilevamento Hardware</h3>
+      <p style="color:var(--fg3);margin-bottom:12px">Verifica automatica di GPU, CUDA, disco, RAM, rete e NCCL.</p>
+      <button class="btn btn-primary" onclick="wizDetectHW()">Avvia Rilevamento</button>
+      <div id="wiz-hw-results" style="margin-top:16px"></div>
+    </div>
+  </div>
+
+  <!-- Step 1: Installation -->
+  <div class="wizard-panel" id="wiz-step-1">
+    <div class="card">
+      <h3>Configurazione Installazione vLLM</h3>
+      <p style="color:var(--fg3);margin-bottom:12px">Scegli le versioni dei componenti. I valori default sono testati per DGX Spark.</p>
+      <div class="form-group">
+        <label>vLLM Commit</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="text" id="wiz-vllm-commit" value="{{ dgx_vllm_commit }}" style="flex:1">
+          <span class="param-tip" data-tip="Commit hash del repository vLLM da compilare. Il default e' testato per Blackwell sm_121. Recuperabile da https://github.com/vllm-project/vllm/commits/main">?</span>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Triton Commit</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="text" id="wiz-triton-commit" value="{{ dgx_triton_commit }}" style="flex:1">
+          <span class="param-tip" data-tip="Commit hash di Triton con supporto sm_121a. Il default include le patch necessarie per Blackwell. Recuperabile da https://github.com/triton-lang/triton/commits/main">?</span>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>PyTorch Index URL</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="text" id="wiz-pytorch-index" value="{{ dgx_pytorch_index }}" style="flex:1">
+          <span class="param-tip" data-tip="URL dell'indice pip per PyTorch con CUDA 13.0. Il default punta all'indice ufficiale cu130. Recuperabile da https://pytorch.org/get-started/locally/">?</span>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Directory Installazione</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="text" id="wiz-install-dir" value="{{ dgx_install_dir }}" style="flex:1">
+          <span class="param-tip" data-tip="Percorso dove verra' installato vLLM. Il venv Python sara' creato in <dir>/.vllm. Richiede almeno 50 GB di spazio libero.">?</span>
+        </div>
+      </div>
+      <div class="btn-row" style="margin-top:16px">
+        <button class="btn btn-primary" onclick="wizStartInstall()">Avvia Installazione</button>
+        <span id="wiz-install-status" style="font-size:12px;color:var(--fg3);align-self:center"></span>
+      </div>
+      <div id="wiz-install-info" style="margin-top:8px;font-size:12px;color:var(--fg3)"></div>
+    </div>
+  </div>
+
+  <!-- Step 2: Engine Parameters -->
+  <div class="wizard-panel" id="wiz-step-2">
+    <div class="card">
+      <h3>Parametri Engine vLLM</h3>
+      <p style="color:var(--fg3);margin-bottom:12px">Configura i parametri del motore vLLM. Passa il mouse sulla (?) per dettagli e raccomandazioni DGX.</p>
+      <div id="wiz-params-container">Caricamento schema parametri...</div>
+    </div>
+  </div>
+
+  <!-- Step 3: Model Selection -->
+  <div class="wizard-panel" id="wiz-step-3">
+    <div class="card">
+      <h3>Selezione Modello</h3>
+      <p style="color:var(--fg3);margin-bottom:12px">Scegli un modello preset ottimizzato per DGX Spark o cerca su HuggingFace.</p>
+
+      <h4 style="margin:12px 0 8px;font-size:14px">Preset DGX Spark (singolo nodo)</h4>
+      <table class="data-table">
+        <thead><tr><th>Modello</th><th>VRAM</th><th>Note</th><th></th></tr></thead>
+        <tbody>
+        {% for m in presets %}
+        <tr><td>{{ m.name }}</td><td>{{ m.vram }}</td><td>{{ m.note }}</td>
+        <td><button class="btn btn-sm" onclick="wizSelectPreset('{{ m.name }}')">Seleziona</button></td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+
+      <h4 style="margin:16px 0 8px;font-size:14px">Preset Multi-Nodo</h4>
+      <table class="data-table">
+        <thead><tr><th>Modello</th><th>Nodi</th><th>TP</th><th>VRAM</th><th></th></tr></thead>
+        <tbody>
+        {% for m in multinode_presets %}
+        <tr><td>{{ m.name }}</td><td>{{ m.nodes }}</td><td>{{ m.tp }}</td><td>{{ m.vram }}</td>
+        <td><button class="btn btn-sm" onclick="wizSelectPreset('{{ m.name }}',{{ m.tp }},{{ m.nodes }})">Seleziona</button></td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+
+      <h4 style="margin:16px 0 8px;font-size:14px">Ricerca HuggingFace</h4>
+      <div class="form-row">
+        <div class="form-group">
+          <input type="text" id="wiz-model-search" placeholder="Cerca modello..." onkeydown="if(event.key==='Enter')wizSearchModel()">
+        </div>
+        <div class="form-group">
+          <button class="btn btn-primary" onclick="wizSearchModel()">Cerca</button>
+        </div>
+      </div>
+      <div id="wiz-model-results" style="max-height:200px;overflow-y:auto"></div>
+
+      <div class="form-group" style="margin-top:16px">
+        <label>Modello Selezionato</label>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="wiz-selected-model" style="flex:1" placeholder="Nessun modello selezionato">
+          <button class="btn btn-secondary" onclick="wizDownloadModel()">Download</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Step 4: Ray Cluster & Network -->
+  <div class="wizard-panel" id="wiz-step-4">
+    <div class="card">
+      <h3>Configurazione Rete & Ray Cluster</h3>
+      <p style="color:var(--fg3);margin-bottom:12px">Configura le variabili di rete NCCL e gestisci i worker remoti.</p>
+
+      <h4 style="margin:12px 0 8px;font-size:14px">Rilevamento Interfacce di Rete</h4>
+      <button class="btn btn-secondary" onclick="wizDetectNetwork()">Rileva Interfacce</button>
+      <div id="wiz-net-results" style="margin-top:8px"></div>
+
+      <h4 style="margin:16px 0 8px;font-size:14px">Variabili NCCL</h4>
+      <div class="param-row">
+        <label>NCCL_SOCKET_IFNAME</label>
+        <input type="text" id="wiz-nccl-socket" placeholder="es. enP2p1s0f1np1">
+        <span class="param-tip" data-tip="Interfaccia di rete per le comunicazioni collettive GPU-to-GPU via NCCL. Deve puntare all'interfaccia 200GbE QSFP, non alla porta di gestione 1GbE. Recuperare con: ibdev2netdev (cercare l'interfaccia Up)">?</span>
+      </div>
+      <div class="param-row">
+        <label>UCX_NET_DEVICES</label>
+        <input type="text" id="wiz-ucx-dev" placeholder="es. enP2p1s0f1np1">
+        <span class="param-tip" data-tip="Dispositivo UCX per il trasporto dati. Tipicamente uguale a NCCL_SOCKET_IFNAME. UCX e' il layer di comunicazione usato da NCCL per le operazioni collettive.">?</span>
+      </div>
+      <div class="param-row">
+        <label>GLOO_SOCKET_IFNAME</label>
+        <input type="text" id="wiz-gloo-socket" placeholder="es. enp1s0f1np1">
+        <span class="param-tip" data-tip="Interfaccia per il backend Gloo (usato per operazioni collettive CPU-side). Puo' essere la stessa di NCCL_SOCKET_IFNAME o un'altra interfaccia di rete.">?</span>
+      </div>
+      <div class="param-row">
+        <label>NCCL_IB_HCA</label>
+        <input type="text" id="wiz-nccl-hca" placeholder="es. mlx5_0,mlx5_1">
+        <span class="param-tip" data-tip="Dispositivi InfiniBand HCA per NCCL. Su DGX Spark con ConnectX-7: tipicamente mlx5_0 e/o mlx5_1. Recuperare con: ibdev2netdev (prima colonna).">?</span>
+      </div>
+      <div class="param-row">
+        <label>VLLM_HOST_IP</label>
+        <input type="text" id="wiz-host-ip" placeholder="es. 192.168.100.10">
+        <span class="param-tip" data-tip="IP di questo nodo sull'interfaccia multi-nodo. Deve essere l'IP assegnato all'interfaccia QSFP. Per il nodo head: il suo IP. Recuperare con: ip addr show <interfaccia>">?</span>
+      </div>
+      <div class="param-row">
+        <label>MASTER_ADDR</label>
+        <input type="text" id="wiz-master-addr" placeholder="es. 192.168.100.10">
+        <span class="param-tip" data-tip="IP del nodo Ray head. Tutti i worker devono poter raggiungere questo indirizzo. Deve essere l'IP del nodo dove gira il Ray head sull'interfaccia QSFP.">?</span>
+      </div>
+
+      <h4 style="margin:16px 0 8px;font-size:14px">Worker Remoti</h4>
+      <p style="color:var(--fg3);font-size:12px;margin-bottom:8px">I worker si gestiscono dal tab DGX Spark. I worker con stato "Pronto" o "Ray Connesso" saranno usati per il cluster.</p>
+      <div id="wiz-workers-list" style="margin-top:8px"></div>
+      <button class="btn btn-secondary" onclick="switchTab('dgx')" style="margin-top:8px">Gestisci Worker nel tab DGX Spark</button>
+    </div>
+  </div>
+
+  <!-- Step 5: Verify & Launch -->
+  <div class="wizard-panel" id="wiz-step-5">
+    <div class="card">
+      <h3>Verifica & Avvio</h3>
+      <p style="color:var(--fg3);margin-bottom:12px">Verifica che tutti i componenti siano pronti, poi avvia il server vLLM.</p>
+
+      <button class="btn btn-primary" onclick="wizVerifyAll()">Verifica Completa</button>
+      <div id="wiz-verify-results" style="margin-top:16px"></div>
+
+      <h4 style="margin:20px 0 8px;font-size:14px">Riepilogo Configurazione</h4>
+      <div id="wiz-summary"></div>
+
+      <div class="btn-row" style="margin-top:20px">
+        <button class="btn btn-success" onclick="wizLaunch()" id="wiz-launch-btn" disabled>Avvia Server vLLM</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Navigation -->
+  <div class="wizard-nav">
+    <button class="btn btn-secondary" id="wiz-btn-back" onclick="wizBack()" style="visibility:hidden">Indietro</button>
+    <button class="btn btn-primary" id="wiz-btn-next" onclick="wizNext()">Avanti</button>
+  </div>
+</div>
+
 <!-- Tab 8: DGX Spark -->
 <div class="tab-panel" id="tab-dgx">
   <!-- Cluster Overview -->
@@ -3280,6 +4400,515 @@ async function dgxStartMultiNode() {
 // Auto-load DGX on page load
 if (document.getElementById('tab-dgx')) {
   setTimeout(() => { refreshDGXCluster(); dgxLoadWorkers(); }, 1500);
+}
+
+// =========================================================================
+// DGX Wizard
+// =========================================================================
+
+let wizState = {};
+let wizCurrentStep = 0;
+const WIZ_TOTAL_STEPS = 6;
+let wizParamsSchema = null;
+let wizCompletedSteps = new Set();
+
+async function wizInit() {
+  try {
+    const data = await apiGet('/api/dgx/wizard/state');
+    wizState = (data && data.wizard) || {};
+    wizCurrentStep = wizState.current_step || 0;
+    if (wizState.completed_steps) {
+      wizCompletedSteps = new Set(wizState.completed_steps);
+    }
+    wizUpdateStepper();
+    wizShowStep(wizCurrentStep);
+  } catch(e) { /* fresh start */ }
+}
+
+function wizShowStep(n) {
+  for (let i = 0; i < WIZ_TOTAL_STEPS; i++) {
+    const panel = document.getElementById('wiz-step-' + i);
+    if (panel) panel.classList.toggle('active', i === n);
+  }
+  wizCurrentStep = n;
+  // Nav buttons
+  const back = document.getElementById('wiz-btn-back');
+  const next = document.getElementById('wiz-btn-next');
+  if (back) back.style.visibility = n === 0 ? 'hidden' : 'visible';
+  if (next) {
+    next.textContent = n === WIZ_TOTAL_STEPS - 1 ? 'Fine' : 'Avanti';
+    next.style.display = n === WIZ_TOTAL_STEPS - 1 ? 'none' : '';
+  }
+  wizUpdateStepper();
+  // Auto-load for specific steps
+  if (n === 2 && !wizParamsSchema) wizLoadParamsSchema();
+  if (n === 4) wizLoadWorkersList();
+  if (n === 5) wizRenderSummary();
+}
+
+function wizUpdateStepper() {
+  for (let i = 0; i < WIZ_TOTAL_STEPS; i++) {
+    const circle = document.getElementById('wiz-sc-' + i);
+    const label = document.getElementById('wiz-sl-' + i);
+    const line = document.getElementById('wiz-line-' + i);
+    if (!circle) continue;
+    circle.className = 'step-circle';
+    label.className = 'step-label';
+    if (wizCompletedSteps.has(i)) {
+      circle.classList.add('completed');
+      circle.innerHTML = '&#10003;';
+      label.classList.add('completed');
+    } else if (i === wizCurrentStep) {
+      circle.classList.add('active');
+      circle.innerHTML = '' + (i + 1);
+      label.classList.add('active');
+    } else {
+      circle.innerHTML = '' + (i + 1);
+    }
+    if (line) {
+      line.className = 'step-line' + (wizCompletedSteps.has(i) ? ' completed' : '');
+    }
+  }
+}
+
+function wizGoToStep(n) {
+  if (n <= wizCurrentStep || wizCompletedSteps.has(n) || wizCompletedSteps.has(n - 1) || n === 0) {
+    wizShowStep(n);
+  }
+}
+
+async function wizSaveState() {
+  wizState.current_step = wizCurrentStep;
+  wizState.completed_steps = Array.from(wizCompletedSteps);
+  try {
+    await apiPost('/api/dgx/wizard/state', {wizard: wizState});
+  } catch(e) {}
+}
+
+function wizNext() {
+  wizCompletedSteps.add(wizCurrentStep);
+  // Save step data
+  wizSaveCurrentStepData();
+  if (wizCurrentStep < WIZ_TOTAL_STEPS - 1) {
+    wizShowStep(wizCurrentStep + 1);
+  }
+  wizSaveState();
+}
+
+function wizBack() {
+  if (wizCurrentStep > 0) {
+    wizShowStep(wizCurrentStep - 1);
+  }
+}
+
+function wizSaveCurrentStepData() {
+  if (wizCurrentStep === 1) wizSaveInstallConfig();
+  if (wizCurrentStep === 2) wizSaveParams();
+  if (wizCurrentStep === 3) wizSaveModel();
+  if (wizCurrentStep === 4) wizSaveRayConfig();
+}
+
+// --- Step 0: Hardware Detection ---
+async function wizDetectHW() {
+  const container = document.getElementById('wiz-hw-results');
+  container.innerHTML = '<div style="color:var(--fg3)">Rilevamento in corso...</div>';
+  try {
+    const data = await apiGet('/api/dgx/wizard/hw-detect');
+    let html = '';
+    // GPU
+    const gpu = data.gpu || {};
+    html += hwCheckItem(gpu.ok, 'GPU', gpu.ok ? `${gpu.name} (${gpu.vram}, Compute ${gpu.compute_cap})` : (gpu.info || 'Non rilevata'));
+    // CUDA
+    const cuda = data.cuda || {};
+    html += hwCheckItem(cuda.ok, 'CUDA Toolkit', cuda.ok ? `Versione ${cuda.version}` : (cuda.info || 'Non trovato'));
+    // Disk
+    const disk = data.disk || {};
+    html += hwCheckItem(disk.ok, 'Disco', disk.info || `${disk.free_gb} GB liberi`);
+    // RAM
+    const ram = data.ram || {};
+    html += hwCheckItem(ram.ok, 'RAM', ram.info || `${ram.total_gb} GB`);
+    // NCCL
+    const nccl = data.nccl || {};
+    html += hwCheckItem(nccl.ok, 'NCCL', nccl.ok ? `Disponibile (${nccl.devices} device)` : (nccl.info || 'Non disponibile'));
+    // Network
+    const net = data.network || {};
+    html += hwCheckItem(net.ok, 'Rete', net.ok ? `${net.interfaces.length} interfacce rilevate` : 'Nessuna interfaccia');
+    if (net.interfaces && net.interfaces.length > 0) {
+      html += '<div style="margin-left:32px;font-size:12px;color:var(--fg3);padding:4px 12px">';
+      net.interfaces.forEach(i => { html += i + '<br>'; });
+      html += '</div>';
+    }
+    // Existing install
+    const inst = data.existing_install || {};
+    if (inst.found) {
+      html += hwCheckItem(true, 'Installazione', `Trovata in ${inst.path}` + (inst.vllm_version ? ` (vLLM ${inst.vllm_version})` : ''));
+    } else {
+      html += hwCheckItem(false, 'Installazione', 'Nessuna installazione trovata', 'warn');
+    }
+    container.innerHTML = html;
+    wizState.hw_detection = data;
+  } catch(e) {
+    container.innerHTML = '<div style="color:var(--red)">Errore: ' + e.message + '</div>';
+  }
+}
+
+function hwCheckItem(ok, label, value, level) {
+  const cls = level === 'warn' ? 'warn' : (ok ? 'pass' : 'fail');
+  const icon = ok ? '&#10003;' : (level === 'warn' ? '!' : '&#10007;');
+  return `<div class="hw-check-item">
+    <div class="hw-check-icon ${cls}">${icon}</div>
+    <div class="hw-check-label">${label}</div>
+    <div class="hw-check-value">${value}</div>
+  </div>`;
+}
+
+// --- Step 1: Installation ---
+async function wizSaveInstallConfig() {
+  const data = {
+    vllm_commit: document.getElementById('wiz-vllm-commit')?.value || '',
+    triton_commit: document.getElementById('wiz-triton-commit')?.value || '',
+    pytorch_index: document.getElementById('wiz-pytorch-index')?.value || '',
+    install_dir: document.getElementById('wiz-install-dir')?.value || '',
+  };
+  wizState.install_config = data;
+  try { await apiPost('/api/dgx/wizard/install-config', data); } catch(e) {}
+}
+
+async function wizStartInstall() {
+  await wizSaveInstallConfig();
+  const statusEl = document.getElementById('wiz-install-status');
+  const infoEl = document.getElementById('wiz-install-info');
+  statusEl.textContent = 'Installazione avviata...';
+  statusEl.style.color = 'var(--orange)';
+  infoEl.textContent = 'Questa operazione richiede 20-30 minuti. Controlla i log nel tab Logs.';
+  try {
+    await apiPost('/api/dgx/wizard/install-start', {});
+    // Poll status
+    const poll = setInterval(async () => {
+      try {
+        const s = await apiGet('/api/dgx/wizard/install-status');
+        if (s.status === 'done') {
+          clearInterval(poll);
+          statusEl.textContent = 'Installazione completata!';
+          statusEl.style.color = 'var(--green)';
+          infoEl.textContent = '';
+          showToast('Installazione vLLM completata', 'success');
+        } else if (s.status === 'error') {
+          clearInterval(poll);
+          statusEl.textContent = 'Errore installazione';
+          statusEl.style.color = 'var(--red)';
+          infoEl.textContent = s.error || '';
+          showToast('Errore installazione: ' + (s.error || ''), 'error');
+        } else {
+          statusEl.textContent = 'Installazione in corso...';
+        }
+      } catch(e) {}
+    }, 5000);
+  } catch(e) {
+    statusEl.textContent = 'Errore: ' + e.message;
+    statusEl.style.color = 'var(--red)';
+  }
+}
+
+// --- Step 2: Engine Parameters ---
+async function wizLoadParamsSchema() {
+  try {
+    const schema = await apiGet('/api/dgx/wizard/params-schema');
+    wizParamsSchema = schema;
+    const container = document.getElementById('wiz-params-container');
+    let html = '';
+    schema.forEach(cat => {
+      const basicParams = cat.params.filter(p => !p.advanced);
+      const advParams = cat.params.filter(p => p.advanced);
+      html += `<div class="param-category">
+        <div class="param-category-header" onclick="this.nextElementSibling.classList.toggle('show');this.nextElementSibling.nextElementSibling?.classList.toggle('show')">
+          <span>${cat.label}</span><span style="color:var(--fg3);font-size:12px">(${cat.params.length} parametri)</span>
+        </div>
+        <div class="param-category-body show">`;
+      basicParams.forEach(p => { html += wizRenderParam(p); });
+      html += '</div>';
+      if (advParams.length > 0) {
+        html += `<div class="param-category-body">`;
+        html += `<div class="advanced-toggle" onclick="this.parentElement.classList.toggle('show')">Mostra Avanzati (${advParams.length})</div>`;
+        advParams.forEach(p => { html += wizRenderParam(p); });
+        html += '</div>';
+      }
+      html += '</div>';
+    });
+    container.innerHTML = html;
+    // Restore saved values
+    wizRestoreParams();
+  } catch(e) {
+    document.getElementById('wiz-params-container').innerHTML = '<div style="color:var(--red)">Errore caricamento schema: ' + e.message + '</div>';
+  }
+}
+
+function wizRenderParam(p) {
+  const saved = (wizState.engine_params || {})[p.key];
+  const val = saved !== undefined ? saved : p.default;
+  const tipText = (p.tooltip || '') + (p.dgx_tip ? '\\n\\nDGX Spark: ' + p.dgx_tip : '');
+  let inputHtml = '';
+  if (p.type === 'select') {
+    const opts = (p.options || []).map(o => {
+      const sel = String(o) === String(val) ? ' selected' : '';
+      const label = o === '' ? '(auto)' : o;
+      return `<option value="${o}"${sel}>${label}</option>`;
+    }).join('');
+    inputHtml = `<select id="wiz-p-${p.key}">${opts}</select>`;
+  } else if (p.type === 'checkbox') {
+    const chk = val ? ' checked' : '';
+    inputHtml = `<input type="checkbox" id="wiz-p-${p.key}"${chk}>`;
+  } else if (p.type === 'range') {
+    inputHtml = `<div style="display:flex;gap:8px;align-items:center">
+      <input type="range" id="wiz-p-${p.key}" min="${p.min||0}" max="${p.max||1}" step="${p.step||0.01}" value="${val}"
+        oninput="document.getElementById('wiz-rv-${p.key}').textContent=this.value">
+      <span class="range-val" id="wiz-rv-${p.key}">${val}</span></div>`;
+  } else {
+    const typeAttr = p.type === 'number' ? 'number' : 'text';
+    const minMax = p.type === 'number' ? ` min="${p.min||''}" max="${p.max||''}"` : '';
+    inputHtml = `<input type="${typeAttr}" id="wiz-p-${p.key}" value="${val || ''}"${minMax}>`;
+  }
+  return `<div class="param-row">
+    <label for="wiz-p-${p.key}">${p.label}${p.required ? ' *' : ''}</label>
+    ${inputHtml}
+    <span class="param-tip" data-tip="${tipText.replace(/"/g, '&quot;')}">?</span>
+  </div>`;
+}
+
+function wizRestoreParams() {
+  if (!wizState.engine_params) return;
+  Object.entries(wizState.engine_params).forEach(([key, val]) => {
+    const el = document.getElementById('wiz-p-' + key);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!val;
+    else el.value = val;
+    const rv = document.getElementById('wiz-rv-' + key);
+    if (rv) rv.textContent = val;
+  });
+}
+
+async function wizSaveParams() {
+  if (!wizParamsSchema) return;
+  const params = {};
+  wizParamsSchema.forEach(cat => {
+    cat.params.forEach(p => {
+      const el = document.getElementById('wiz-p-' + p.key);
+      if (!el) return;
+      if (p.type === 'checkbox') params[p.key] = el.checked;
+      else if (p.type === 'number' || p.type === 'range') params[p.key] = el.value ? parseFloat(el.value) : p.default;
+      else params[p.key] = el.value;
+    });
+  });
+  wizState.engine_params = params;
+  try { await apiPost('/api/dgx/wizard/params-save', params); } catch(e) {}
+}
+
+// --- Step 3: Model Selection ---
+function wizSelectPreset(modelId, tp, nodes) {
+  document.getElementById('wiz-selected-model').value = modelId;
+  wizState.model_config = {model_id: modelId};
+  if (tp) {
+    const tpEl = document.getElementById('wiz-p-tensor_parallel_size');
+    if (tpEl) tpEl.value = tp;
+  }
+  if (nodes) {
+    const nnEl = document.getElementById('wiz-p-nnodes');
+    if (nnEl) nnEl.value = nodes;
+  }
+  showToast('Modello selezionato: ' + modelId, 'info');
+}
+
+async function wizSearchModel() {
+  const q = document.getElementById('wiz-model-search').value.trim();
+  if (!q) return;
+  const container = document.getElementById('wiz-model-results');
+  container.innerHTML = '<div style="color:var(--fg3)">Ricerca...</div>';
+  try {
+    const data = await apiGet('/api/models/search?q=' + encodeURIComponent(q));
+    if (!data.results || data.results.length === 0) {
+      container.innerHTML = '<div style="color:var(--fg3)">Nessun risultato</div>';
+      return;
+    }
+    let html = '<table class="data-table"><thead><tr><th>Modello</th><th>Downloads</th><th></th></tr></thead><tbody>';
+    data.results.forEach(m => {
+      html += `<tr><td>${m.id || m.modelId || m.name}</td><td>${m.downloads || ''}</td>
+        <td><button class="btn btn-sm" onclick="wizSelectPreset('${m.id || m.modelId || m.name}')">Seleziona</button></td></tr>`;
+    });
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div style="color:var(--red)">Errore: ' + e.message + '</div>';
+  }
+}
+
+async function wizDownloadModel() {
+  const model = document.getElementById('wiz-selected-model').value.trim();
+  if (!model) { showToast('Seleziona un modello prima', 'warn'); return; }
+  showToast('Download avviato per ' + model + '. Controlla i log.', 'info');
+  try { await apiPost('/api/dgx/wizard/model-download', {model: model}); } catch(e) {}
+}
+
+async function wizSaveModel() {
+  const model = document.getElementById('wiz-selected-model')?.value?.trim() || '';
+  wizState.model_config = {model_id: model};
+  // Also set it in engine_params
+  if (model) {
+    if (!wizState.engine_params) wizState.engine_params = {};
+    wizState.engine_params.model = model;
+    const modelEl = document.getElementById('wiz-p-model');
+    if (modelEl) modelEl.value = model;
+  }
+  try { await apiPost('/api/dgx/wizard/model-save', {model_id: model}); } catch(e) {}
+}
+
+// --- Step 4: Ray Cluster ---
+async function wizDetectNetwork() {
+  const container = document.getElementById('wiz-net-results');
+  container.innerHTML = '<div style="color:var(--fg3)">Rilevamento...</div>';
+  try {
+    const data = await apiGet('/api/dgx/wizard/net-detect');
+    let html = '';
+    if (data.interfaces && data.interfaces.length > 0) {
+      html += '<div style="font-size:12px;margin-bottom:8px">';
+      data.interfaces.forEach(i => { html += '<div style="padding:2px 0;color:var(--fg2)">' + i + '</div>'; });
+      html += '</div>';
+    }
+    if (data.ip_info && data.ip_info.length > 0) {
+      html += '<div style="font-size:12px;color:var(--fg3);margin-bottom:8px">';
+      data.ip_info.forEach(i => { html += '<div>' + i + '</div>'; });
+      html += '</div>';
+    }
+    // Auto-fill suggested values
+    if (data.suggested) {
+      const s = data.suggested;
+      if (s.NCCL_SOCKET_IFNAME) document.getElementById('wiz-nccl-socket').value = s.NCCL_SOCKET_IFNAME;
+      if (s.UCX_NET_DEVICES) document.getElementById('wiz-ucx-dev').value = s.UCX_NET_DEVICES;
+      if (s.GLOO_SOCKET_IFNAME) document.getElementById('wiz-gloo-socket').value = s.GLOO_SOCKET_IFNAME;
+      if (s.NCCL_IB_HCA) document.getElementById('wiz-nccl-hca').value = s.NCCL_IB_HCA;
+      html += '<div style="color:var(--green);font-size:12px">Valori suggeriti applicati automaticamente.</div>';
+    }
+    container.innerHTML = html || '<div style="color:var(--fg3)">Nessuna interfaccia rilevata</div>';
+  } catch(e) {
+    container.innerHTML = '<div style="color:var(--red)">Errore: ' + e.message + '</div>';
+  }
+}
+
+async function wizSaveRayConfig() {
+  const data = {
+    NCCL_SOCKET_IFNAME: document.getElementById('wiz-nccl-socket')?.value || '',
+    UCX_NET_DEVICES: document.getElementById('wiz-ucx-dev')?.value || '',
+    GLOO_SOCKET_IFNAME: document.getElementById('wiz-gloo-socket')?.value || '',
+    NCCL_IB_HCA: document.getElementById('wiz-nccl-hca')?.value || '',
+    VLLM_HOST_IP: document.getElementById('wiz-host-ip')?.value || '',
+    MASTER_ADDR: document.getElementById('wiz-master-addr')?.value || '',
+  };
+  wizState.ray_config = data;
+  try { await apiPost('/api/dgx/wizard/ray-config', data); } catch(e) {}
+}
+
+async function wizLoadWorkersList() {
+  const container = document.getElementById('wiz-workers-list');
+  try {
+    const data = await apiGet('/api/dgx/workers');
+    if (!data.workers || Object.keys(data.workers).length === 0) {
+      container.innerHTML = '<div style="color:var(--fg3);font-size:12px">Nessun worker configurato. Aggiungi worker dal tab DGX Spark.</div>';
+      return;
+    }
+    let html = '<table class="data-table"><thead><tr><th>IP</th><th>Alias</th><th>Stato</th></tr></thead><tbody>';
+    Object.entries(data.workers).forEach(([ip, w]) => {
+      const st = w.status || 'unknown';
+      const color = st === 'ready' || st === 'ray_connected' ? 'var(--green)' : st === 'error' ? 'var(--red)' : 'var(--fg3)';
+      html += `<tr><td>${ip}</td><td>${w.alias || ''}</td><td style="color:${color}">${st}</td></tr>`;
+    });
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div style="color:var(--red)">Errore caricamento worker</div>';
+  }
+}
+
+// --- Step 5: Verify & Launch ---
+async function wizVerifyAll() {
+  const container = document.getElementById('wiz-verify-results');
+  container.innerHTML = '<div style="color:var(--fg3)">Verifica in corso...</div>';
+  try {
+    const data = await apiPost('/api/dgx/wizard/verify-all', {});
+    let html = '<h4 style="font-size:13px;margin-bottom:8px">Nodo Locale</h4>';
+    Object.entries(data.local || {}).forEach(([key, v]) => {
+      html += hwCheckItem(v.ok, key.toUpperCase(), v.info || (v.ok ? 'OK' : 'Non disponibile'));
+    });
+    if (data.workers && Object.keys(data.workers).length > 0) {
+      html += '<h4 style="font-size:13px;margin:12px 0 8px">Worker Remoti</h4>';
+      Object.entries(data.workers).forEach(([ip, wr]) => {
+        html += `<div style="font-weight:600;font-size:12px;padding:4px 12px;color:var(--fg2)">${ip}</div>`;
+        Object.entries(wr.results || {}).forEach(([key, v]) => {
+          html += hwCheckItem(v.ok, key.toUpperCase(), v.info || '');
+        });
+      });
+    }
+    if (data.all_passed) {
+      html += '<div style="color:var(--green);font-weight:600;margin-top:12px;padding:8px 12px">Tutte le verifiche superate!</div>';
+      document.getElementById('wiz-launch-btn').disabled = false;
+    } else {
+      html += '<div style="color:var(--orange);margin-top:12px;padding:8px 12px">Alcune verifiche non superate. Il lancio e\' comunque possibile.</div>';
+      document.getElementById('wiz-launch-btn').disabled = false;
+    }
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<div style="color:var(--red)">Errore verifica: ' + e.message + '</div>';
+  }
+}
+
+function wizRenderSummary() {
+  const container = document.getElementById('wiz-summary');
+  const p = wizState.engine_params || {};
+  const m = wizState.model_config || {};
+  const r = wizState.ray_config || {};
+  let html = '<table class="wizard-summary">';
+  const addRow = (label, val) => { if (val) html += `<tr><td>${label}</td><td>${val}</td></tr>`; };
+  addRow('Modello', p.model || m.model_id || '<em>Non configurato</em>');
+  addRow('Dtype', p.dtype);
+  addRow('Max Context', p.max_model_len || 'auto');
+  addRow('GPU Memory Util', p.gpu_memory_utilization);
+  addRow('Tensor Parallel', p.tensor_parallel_size);
+  addRow('Pipeline Parallel', p.pipeline_parallel_size > 1 ? p.pipeline_parallel_size : '');
+  addRow('Nodi', p.nnodes > 1 ? p.nnodes : '1');
+  addRow('Host:Port', (p.host || '0.0.0.0') + ':' + (p.port || 8000));
+  addRow('Attention Backend', p.attention_backend || 'auto');
+  addRow('Quantizzazione', p.quantization || 'nessuna');
+  addRow('Prefix Caching', p.enable_prefix_caching ? 'Attivo' : 'Disattivo');
+  addRow('KV Cache Dtype', p.kv_cache_dtype || 'auto');
+  addRow('Executor Backend', p.distributed_executor_backend || 'auto');
+  if (r.NCCL_SOCKET_IFNAME) addRow('NCCL Interface', r.NCCL_SOCKET_IFNAME);
+  if (r.VLLM_HOST_IP) addRow('VLLM Host IP', r.VLLM_HOST_IP);
+  html += '</table>';
+  container.innerHTML = html;
+}
+
+async function wizLaunch() {
+  // Ensure all step data is saved
+  await wizSaveParams();
+  await wizSaveModel();
+  await wizSaveRayConfig();
+  await wizSaveState();
+
+  showToast('Avvio server vLLM...', 'info');
+  try {
+    const data = await apiPost('/api/dgx/wizard/launch', {});
+    if (data.error) {
+      showToast('Errore: ' + data.error, 'error');
+    } else {
+      showToast('Server vLLM avviato! Controlla stato nel tab Server.', 'success');
+      switchTab('server');
+    }
+  } catch(e) {
+    showToast('Errore avvio: ' + e.message, 'error');
+  }
+}
+
+// Init wizard on page load
+if (document.getElementById('tab-dgx-wizard')) {
+  setTimeout(wizInit, 500);
 }
 </script>
 </body>
